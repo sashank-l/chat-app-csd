@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Group Chat</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <!-- Join Screen -->
+    <div id="join-screen" class="screen">
+        <div class="card">
+            <h1>💬 Group Chat</h1>
+
+            <p class="subtitle">
+                Enter a username to join the room
+            </p>
+
+            <input id="username-input" type="text" maxlength="24" placeholder="e.g. Alice" autocomplete="off">
+
+            <button id="join-btn">
+                Join Chat
+            </button>
+
+            <p id="join-error" class="error"></p>
+        </div>
+    </div>
+
+
+    <!-- Chat Screen -->
+    <div id="chat-screen" class="screen hidden">
+
+        <aside class="sidebar">
+
+            <h2>
+                Online (<span id="user-count">0</span>)
+            </h2>
+
+            <ul id="user-list"></ul>
+
+            <div class="conn-status" id="conn-status">
+                ● connecting…
+            </div>
+
+        </aside>
+
+
+        <main class="chat-main">
+
+            <header class="chat-header">
+
+                <span>
+                    Room:
+                    <strong>general</strong>
+                </span>
+
+                <span id="me-label"></span>
+
+            </header>
+
+
+            <div id="messages" class="messages"></div>
+
+
+            <div id="typing-indicator" class="typing-indicator"></div>
+
+
+            <form id="message-form" class="message-form">
+
+                <input id="message-input" type="text" placeholder="Type a message…" autocomplete="off" maxlength="2000">
+
+                <button type="submit">
+                    Send
+                </button>
+
+            </form>
+
+        </main>
+
+    </div>
+
+
+    <script src="crypto.js"></script>
+    <script src="app.js"></script>
+
+</body>
+
+</html>

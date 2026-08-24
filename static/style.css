@@ -1,0 +1,403 @@
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #111315;
+    color: #e7e9ea;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.hidden {
+    display: none !important;
+}
+
+
+/* ---------- Join Screen ---------- */
+
+#join-screen {
+    height: 100vh;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    background: #111315;
+}
+
+.card {
+    background: #191c1f;
+
+    padding: 40px;
+
+    border: 1px solid #292e32;
+    border-radius: 14px;
+
+    width: 340px;
+
+    text-align: center;
+
+    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+}
+
+.card h1 {
+    font-size: 26px;
+    margin-bottom: 8px;
+    color: #f1f3f4;
+}
+
+.subtitle {
+    color: #899196;
+    margin-bottom: 20px;
+    font-size: 14px;
+}
+
+#username-input {
+    width: 100%;
+
+    padding: 12px;
+
+    border-radius: 8px;
+    border: 1px solid #343a3f;
+
+    background: #111315;
+    color: #e7e9ea;
+
+    font-size: 15px;
+
+    margin-bottom: 14px;
+
+    outline: none;
+}
+
+#username-input:focus {
+    border-color: #2dd4bf;
+
+    box-shadow:
+        0 0 0 3px rgba(45, 212, 191, 0.1);
+}
+
+#join-btn {
+    width: 100%;
+
+    padding: 12px;
+
+    border: none;
+    border-radius: 8px;
+
+    background: #14b8a6;
+    color: #06201d;
+
+    font-size: 15px;
+    font-weight: 700;
+
+    cursor: pointer;
+
+    transition:
+        background 0.2s,
+        transform 0.2s;
+}
+
+#join-btn:hover {
+    background: #2dd4bf;
+    transform: translateY(-1px);
+}
+
+.error {
+    color: #fb7185;
+
+    margin-top: 10px;
+
+    font-size: 13px;
+
+    min-height: 16px;
+}
+
+
+/* ---------- Chat Screen ---------- */
+
+#chat-screen {
+    display: flex;
+
+    height: 100vh;
+
+    background: #111315;
+}
+
+.sidebar {
+    width: 220px;
+
+    background: #191c1f;
+
+    padding: 20px;
+
+    display: flex;
+    flex-direction: column;
+
+    border-right: 1px solid #292e32;
+}
+
+.sidebar h2 {
+    font-size: 15px;
+
+    color: #899196;
+
+    margin-bottom: 12px;
+
+    text-transform: uppercase;
+
+    letter-spacing: 0.05em;
+}
+
+#user-list {
+    list-style: none;
+
+    flex: 1;
+
+    overflow-y: auto;
+}
+
+#user-list li {
+    padding: 8px 10px;
+
+    border-radius: 7px;
+
+    margin-bottom: 4px;
+
+    background: #111315;
+
+    color: #cbd0d3;
+
+    font-size: 14px;
+}
+
+#user-list li.me {
+    border-left: 3px solid #2dd4bf;
+
+    padding-left: 7px;
+
+    font-weight: 600;
+
+    color: #f1f3f4;
+}
+
+.conn-status {
+    font-size: 12px;
+    color: #34d399;
+}
+
+.conn-status.offline {
+    color: #fb7185;
+}
+
+
+/* ---------- Main Chat ---------- */
+
+.chat-main {
+    flex: 1;
+
+    display: flex;
+    flex-direction: column;
+}
+
+.chat-header {
+    padding: 14px 20px;
+
+    background: #191c1f;
+
+    border-bottom: 1px solid #292e32;
+
+    display: flex;
+
+    justify-content: space-between;
+
+    font-size: 14px;
+}
+
+#me-label {
+    color: #899196;
+}
+
+
+/* ---------- Messages ---------- */
+
+.messages {
+    flex: 1;
+
+    padding: 20px;
+
+    overflow-y: auto;
+
+    display: flex;
+    flex-direction: column;
+
+    gap: 10px;
+}
+
+.msg {
+    max-width: 60%;
+
+    padding: 10px 14px;
+
+    border-radius: 11px;
+
+    background: #1d2124;
+
+    border: 1px solid #292e32;
+}
+
+.msg .meta {
+    font-size: 11px;
+
+    color: #899196;
+
+    margin-bottom: 3px;
+}
+
+.msg .text {
+    font-size: 14px;
+
+    word-wrap: break-word;
+
+    color: #e7e9ea;
+}
+
+.msg.own {
+    align-self: flex-end;
+
+    background: #115e59;
+
+    border-color: #14756e;
+}
+
+.msg.own .meta {
+    color: #99f6e4;
+}
+
+.notice {
+    align-self: center;
+
+    font-size: 12px;
+
+    color: #6f787d;
+
+    font-style: italic;
+
+    background: transparent;
+}
+
+.typing-indicator {
+    height: 18px;
+
+    padding: 0 20px;
+
+    font-size: 12px;
+
+    color: #899196;
+
+    font-style: italic;
+}
+
+
+/* ---------- Message Input ---------- */
+
+.message-form {
+    display: flex;
+
+    padding: 14px;
+
+    gap: 10px;
+
+    border-top: 1px solid #292e32;
+
+    background: #191c1f;
+}
+
+#message-input {
+    flex: 1;
+
+    padding: 12px;
+
+    border-radius: 8px;
+
+    border: 1px solid #343a3f;
+
+    background: #111315;
+
+    color: #e7e9ea;
+
+    font-size: 14px;
+
+    outline: none;
+}
+
+#message-input:focus {
+    border-color: #2dd4bf;
+
+    box-shadow:
+        0 0 0 3px rgba(45, 212, 191, 0.08);
+}
+
+.message-form button {
+    padding: 12px 20px;
+
+    border: none;
+
+    border-radius: 8px;
+
+    background: #14b8a6;
+
+    color: #06201d;
+
+    font-weight: 700;
+
+    cursor: pointer;
+
+    transition:
+        background 0.2s,
+        transform 0.2s;
+}
+
+.message-form button:hover {
+    background: #2dd4bf;
+
+    transform: translateY(-1px);
+}
+
+/* --- Member 3 & 4: signature / tamper badges --- */
+
+.badge {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    vertical-align: middle;
+}
+
+.badge-verified {
+    background: rgba(45, 212, 191, 0.15);
+    color: #2dd4bf;
+}
+
+.badge-unverified {
+    background: rgba(148, 163, 184, 0.15);
+    color: #94a3b8;
+}
+
+.badge-tampered {
+    background: rgba(248, 113, 113, 0.15);
+    color: #f87171;
+}
+
+.msg.tampered .text {
+    border: 1px dashed #f87171;
+    border-radius: 8px;
+    padding: 6px 8px;
+}
