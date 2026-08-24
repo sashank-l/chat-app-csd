@@ -1,134 +1,180 @@
-# 💬 GRP-CHAT: Secure Real-Time Group Chat Application
+# Distributed Secure Chat with Go Load Balancer
 
-A lightweight, real-time web-based group chat application built with **Flask**, **WebSockets**, and **SQLite**. The system implements multiple layers of cryptography, including server-side encryption at rest, ECDSA digital signatures for message authentication, and a SHA-256 hash chain for database tamper detection.
+This project integrates a secure real-time group chat backend with a custom Go load balancer and benchmark tooling.
 
----
+The implementation follows the assignment charter goals:
+1. Build a custom load balancer in Go for both HTTP and WebSocket traffic.
+2. Deploy the secure chat backend across multiple backend instances.
+3. Build a concurrent load generator and measure performance under load.
+4. Compare single-backend and multi-backend behavior using throughput, error rate, and latency metrics.
 
-## 🔒 Security & Cryptographic Features
+## Project Scope
 
-1. **Encryption at Rest (Fernet / AES-128-CBC + HMAC-SHA256)**
-   - All message contents are encrypted before being written to SQLite (`chat.db`).
-   - Uses `cryptography.fernet.Fernet` with a master secret key stored in `secret.key` or supplied via the `CHAT_SECRET_KEY` environment variable.
-   - Plaintext messages are never stored in the database.
+The system combines two parts:
+1. Secure messaging backend (Python/Flask/WebSocket) with encryption, signatures, and tamper-evident storage.
+2. Distributed traffic management and benchmarking (Go load balancer + load generators).
 
-2. **Digital Signatures (ECDSA P-256 + SHA-256)**
-   - Every active chat session generates an ECDSA keypair using curve `SECP256R1`.
-   - Messages are canonicalized (`username|text|timestamp`) and signed with the sender's session private key.
-   - Public keys (in PEM format) are stored alongside messages in SQLite to allow signature verification when history is loaded.
+## Core Features
 
-3. **Tamper-Evident Hash Chain (SHA-256)**
-   - Stored messages are linked sequentially in a blockchain-style hash chain:
-     $$\text{record\_hash} = \text{SHA256}(\text{prev\_hash} \mid \text{username} \mid \text{ciphertext} \mid \text{signature} \mid \text{timestamp})$$
-   - Modifying, inserting, or deleting any message directly in the SQLite database breaks subsequent hashes in the chain, triggering visual tamper warnings (`⚠ tampered`) in the client UI.
+### Secure Chat Backend
+1. Encryption at rest using Fernet (AES-CBC with authentication).
+2. ECDSA P-256 signatures for message authenticity.
+3. SHA-256 hash chain for tamper evidence in persisted history.
+4. Real-time WebSocket messaging with user presence and typing indicators.
 
-4. **Real-Time WebSocket Architecture**
-   - Built on `flask-sock` for low-latency bidirectional messaging.
-   - Features online user lists, real-time connection status indicators, typing indicators, auto-reconnection, and message history synchronization.
+### Go Load Balancer
+1. Proxies regular HTTP requests to backend instances.
+2. Handles WebSocket upgrade requests and full-duplex streaming via TCP hijacking.
+3. Supports least-connections and round-robin routing modes.
+4. Runs backend health checks using the /health endpoint.
+5. Exposes /lb-stats for live backend connection and routing statistics.
 
----
+### Benchmarking
+1. Go load generator: high-concurrency RFC-6455 client implementation.
+2. Python benchmark scripts for automated comparison runs.
+3. Reports throughput, sent/received totals, errors, and percentile latencies.
 
-## 🛠️ Technology Stack
+## Repository Structure
 
-- **Backend**: Python 3, Flask, Flask-Sock (WebSocket), SQLite3, Cryptography (`cryptography` library)
-- **Frontend**: Vanilla JavaScript (ES6+), HTML5, Custom CSS3 (Dark Theme)
+```text
+app.py                         Python secure chat backend
+crypto_utils.py                Message encryption/decryption helpers
+signatures.py                  ECDSA signing and verification
+integrity.py                   Hash chain generation and verification
+db.py                          SQLite persistence and query helpers
 
----
+load_balancer/main.go          Go HTTP + WebSocket load balancer
+load_generator/main.go         Go benchmark load generator
 
-## 📁 Directory & File Structure
+benchmark/load_generator.py    Python async load generator
+benchmark/run_comparison.py    Python benchmark summary runner
 
+static/index.html              Chat UI
+static/app.js                  WebSocket client logic
+static/style.css               UI styles
+
+cipher-test.py                 DB ciphertext tampering test
+key-tampering.py               DB public-key tampering test
 ```
-GRP-CHAT/
-├── app.py              # Main Flask server & WebSocket handler (/ws)
-├── crypto_utils.py     # Symmetric encryption at rest (Fernet AES-128)
-├── db.py               # SQLite database setup, query execution & persistence
-├── integrity.py        # SHA-256 hash chain creation & chain verification
-├── signatures.py       # ECDSA P-256 key pair generation, signing & verification
-├── cipher-test.py      # Security test script: simulates ciphertext database tampering
-├── key-tampering.py    # Security test script: simulates public key database tampering
-├── requirements.txt    # Python dependencies
-├── static/
-│   ├── index.html      # Single Page Application HTML structure
-│   ├── app.js          # WebSocket connection, event handling & UI rendering
-│   └── style.css       # Sleek dark-theme stylesheet and status badges
-└── secret.key          # Auto-generated symmetric encryption key (gitignored)
-```
 
----
+## Environment and Ports
 
-## 📊 Database Schema (`chat.db`)
+Default backend and load balancer ports in this codebase:
+1. Load balancer entry: 4209
+2. Backend 1: 4210
+3. Backend 2: 4211
+4. Backend 3: 4212
 
-### `messages` Table
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `id` | `INTEGER PRIMARY KEY` | Auto-incrementing message ID |
-| `username` | `TEXT` | Display name of sender |
-| `ciphertext` | `TEXT` | Encrypted message content (Base64 Fernet token) |
-| `signature` | `TEXT` | Base64-encoded ECDSA signature |
-| `pubkey_jwk` | `TEXT` | Sender's public key in PEM format |
-| `timestamp` | `INTEGER` | Unix timestamp (ms) |
-| `prev_hash` | `TEXT` | SHA-256 hash of previous message entry |
-| `record_hash` | `TEXT` | SHA-256 hash of current message entry |
+Typical endpoints:
+1. HTTP via load balancer: http://HOST:4209/
+2. WebSocket via load balancer: ws://HOST:4209/ws
+3. Load balancer stats: http://HOST:4209/lb-stats
+4. Backend health check: http://HOST:4210/health (and similarly 4211/4212)
 
-### `users` Table
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `username` | `TEXT PRIMARY KEY` | Registered user display name |
-| `pubkey_jwk` | `TEXT` | Public key associated with user |
+## Setup
 
----
+### 1. Python dependencies
 
-## 🚀 Getting Started
-
-### 1. Prerequisites
-Make sure Python 3.9+ is installed on your system.
-
-### 2. Installation
-Clone the repository and install dependencies:
 ```bash
-# Clone repository
-git clone <repository-url>
-cd GRP-CHAT
-
-# Create virtual environment (optional but recommended)
-python3 -m venv venv
-source venv/bin/activate
-
-# Install required packages
 pip install -r requirements.txt
 ```
 
-### 3. Running the Server
-Start the Flask WebSocket application:
+### 2. Backend app dependencies for benchmark scripts
+
+If you plan to run Python benchmark scripts in benchmark/, install websockets:
+
 ```bash
-python3 app.py
+pip install websockets
 ```
-The server will run at:
--
 
-Open `http://10.1.75.51:4309/` in multiple browser windows or tabs to test multi-user real-time chat.
+### 3. Go toolchain
 
----
+Install Go (1.21+ recommended) to build and run:
+1. load_balancer/main.go
+2. load_generator/main.go
 
-## 🧪 Security & Tamper Testing Scripts
+## Running the System
 
-The repository includes scripts to test the tamper-detection mechanisms of the application:
+### Start backend instances
 
-### Testing Ciphertext Modification (`cipher-test.py`)
-Simulates an attacker modifying message content directly in the database:
+Run one backend process per target port (on separate hosts/containers in distributed mode).
+
+Example for one local backend:
+
 ```bash
-python3 cipher-test.py
+python app.py --port 4210
 ```
-*Effect*: Upon refreshing or connecting a new client, the modified message displays `[unreadable — ciphertext corrupted]` and flags a `⚠ tampered` badge.
 
-### Testing Public Key Tampering (`key-tampering.py`)
-Simulates an attacker altering stored public keys to invalidate digital signatures:
+Repeat with adjusted ports/hosts for 4211 and 4212 as needed.
+
+### Start the load balancer
+
 ```bash
-python3 key-tampering.py
+go run load_balancer/main.go \
+  -port 4209 \
+  -mode all \
+  -algo leastconn \
+  -backends "http://172.17.0.11:4210,http://172.17.0.12:4211,http://172.17.0.13:4212"
 ```
-*Effect*: Signature verification fails for the targeted message, indicating unverified signature status in the UI.
 
----
+Single-backend comparison mode:
 
-## 📜 License & Notes
+```bash
+go run load_balancer/main.go -port 4209 -mode single -algo leastconn
+```
 
-- **`secret.key`**: Automatically generated on first launch if not provided via `CHAT_SECRET_KEY` environment variable. Ensure this file is kept secret and not committed to version control.
+### Open the app
+
+Open the load balancer URL in your browser:
+
+```text
+http://HOST:4209/
+```
+
+The frontend automatically uses the same host for WebSocket upgrades at /ws.
+
+## Running Benchmarks
+
+### Go load generator
+
+```bash
+go run load_generator/main.go -url ws://HOST:4209/ws -clients 50 -duration 20 -interval 200
+```
+
+### Python benchmark summary
+
+```bash
+python benchmark/run_comparison.py --url ws://HOST:4209/ws --clients 50 --duration 20 --interval 0.15
+```
+
+### Python async load generator
+
+```bash
+python benchmark/load_generator.py --url ws://HOST:4209/ws --clients 50 --duration 20 --interval 0.2
+```
+
+## Security Validation Scripts
+
+Use included scripts to demonstrate tamper detection behavior:
+
+```bash
+python cipher-test.py
+python key-tampering.py
+```
+
+Expected outcomes:
+1. Ciphertext tampering results in unreadable content and tamper flags.
+2. Public key tampering causes signature verification failure.
+
+## Charter Alignment Summary
+
+1. Custom Go load balancer is implemented with WebSocket-aware proxying.
+2. Secure chat backend is integrated behind the balancer across multiple nodes.
+3. Concurrent load generation is implemented in both Go and Python.
+4. Performance comparison workflow (single vs multi backend) is included and reproducible.
+
+## Notes
+
+1. Keep secret.key private and never commit secrets.
+2. For distributed runs, use your container/internal IP mapping for backend URLs.
+3. For local testing, you can run all components on localhost with different ports.
