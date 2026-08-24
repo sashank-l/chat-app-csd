@@ -1,8 +1,9 @@
+import argparse
 import json
 import threading
 import time
 
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, jsonify
 from flask_sock import Sock
 
 import db
@@ -11,8 +12,8 @@ import signatures
 import integrity
 
 
-HOST = "0.0.0.0"
-PORT = 4309
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 4210
 
 
 app = Flask(
@@ -34,6 +35,11 @@ clients_lock = threading.Lock()
 
 
 db.init_db()
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "service": "chat-backend", "online_users": len(clients)}), 200
 
 
 @app.route("/")
@@ -529,23 +535,26 @@ def ws_handler(ws):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Secure Group Chat Backend")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Host to bind (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind (e.g., 4210, 4211, 4212)")
+    args = parser.parse_args()
+
+    host = args.host
+    port = args.port
 
     print(
         f"Group chat server listening on "
-        f"http://{HOST}:{PORT}"
+        f"http://{host}:{port}"
     )
 
     print(
         f"WebSocket endpoint: "
-        f"ws://{HOST}:{PORT}/ws"
+        f"ws://{host}:{port}/ws"
     )
 
-
     app.run(
-
-        host=HOST,
-
-        port=PORT,
-
+        host=host,
+        port=port,
         threaded=True
     )
