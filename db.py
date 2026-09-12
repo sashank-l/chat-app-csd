@@ -5,7 +5,7 @@ import threading
 DB_PATH = "chat.db"
 _conn = None
 _conn_pid = None
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 _seen_msg_ids = set()
 _seen_lock = threading.Lock()
 
