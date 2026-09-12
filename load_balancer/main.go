@@ -1,14 +1,15 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
+	"math"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -16,327 +17,519 @@ import (
 	"time"
 )
 
-// Backend represents a single chat server instance (Sys2, Sys3, or Sys4).
+// newUUID generates a random UUID v4 using crypto/rand (no external dependency).
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]),
+		hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]),
+		hex.EncodeToString(b[8:10]),
+		hex.EncodeToString(b[10:]),
+	)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend struct: tracks a single backend's health and metrics
+// ─────────────────────────────────────────────────────────────────────────────
+
+type HealthData struct {
+	Status            string  `json:"status"`
+	CPUPercent        float64 `json:"cpu_percent"`
+	MemoryPercent     float64 `json:"memory_percent"`
+	ActiveConnections int     `json:"active_connections"`
+	AvgResponseMs     float64 `json:"avg_response_ms"`
+	MessageCount      int     `json:"message_count"`
+	LoadScore         float64 `json:"load_score"`
+}
+
 type Backend struct {
-	URL          *url.URL
-	Alive        bool
-	ReverseProxy *httputil.ReverseProxy
-	ActiveConns  int64
-	TotalServed  int64
-	mux          sync.RWMutex
+	URL             string
+	Alive           bool
+	ConsecutiveFail int
+	CooldownUntil   time.Time
+	Health          HealthData
+	TotalServed     int64
+	TotalErrors     int64
+	mux             sync.RWMutex
 }
 
 func (b *Backend) SetAlive(alive bool) {
 	b.mux.Lock()
 	defer b.mux.Unlock()
+	if !alive {
+		b.ConsecutiveFail++
+		if b.ConsecutiveFail >= 3 {
+			b.CooldownUntil = time.Now().Add(60 * time.Second)
+			log.Printf("[CIRCUIT BREAKER] %s in cooldown for 60s", b.URL)
+		}
+	} else {
+		b.ConsecutiveFail = 0
+		b.CooldownUntil = time.Time{}
+	}
 	b.Alive = alive
 }
 
-func (b *Backend) IsAlive() bool {
+func (b *Backend) IsAvailable() bool {
 	b.mux.RLock()
 	defer b.mux.RUnlock()
-	return b.Alive
-}
-
-func (b *Backend) IncrConn() {
-	atomic.AddInt64(&b.ActiveConns, 1)
-	atomic.AddInt64(&b.TotalServed, 1)
-}
-
-func (b *Backend) DecrConn() {
-	atomic.AddInt64(&b.ActiveConns, -1)
-}
-
-func (b *Backend) GetActiveConns() int64 {
-	return atomic.LoadInt64(&b.ActiveConns)
-}
-
-func (b *Backend) GetTotalServed() int64 {
-	return atomic.LoadInt64(&b.TotalServed)
-}
-
-// ServerPool maintains the pool of backends and routes traffic.
-type ServerPool struct {
-	backends []*Backend
-	current  uint64
-	algo     string // "leastconn" or "roundrobin"
-	mux      sync.RWMutex
-}
-
-func (s *ServerPool) AddBackend(backend *Backend) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-	s.backends = append(s.backends, backend)
-}
-
-// NextBackend selects the next available healthy backend based on the configured algorithm.
-func (s *ServerPool) NextBackend() *Backend {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-
-	var healthy []*Backend
-	for _, b := range s.backends {
-		if b.IsAlive() {
-			healthy = append(healthy, b)
-		}
-	}
-
-	if len(healthy) == 0 {
-		return nil
-	}
-
-	if s.algo == "leastconn" {
-		least := healthy[0]
-		minConns := least.GetActiveConns()
-		for _, b := range healthy[1:] {
-			if conns := b.GetActiveConns(); conns < minConns {
-				least = b
-				minConns = conns
-			}
-		}
-		return least
-	}
-
-	// Default: Round Robin
-	idx := atomic.AddUint64(&s.current, 1) % uint64(len(healthy))
-	return healthy[idx]
-}
-
-// HealthCheck periodically pings /health on all backends.
-func (s *ServerPool) HealthCheck(interval time.Duration) {
-	client := http.Client{
-		Timeout: 2 * time.Second,
-	}
-
-	for range time.Tick(interval) {
-		s.mux.RLock()
-		backends := append([]*Backend(nil), s.backends...)
-		s.mux.RUnlock()
-
-		for _, b := range backends {
-			healthURL := b.URL.String() + "/health"
-			resp, err := client.Get(healthURL)
-			alive := err == nil && resp.StatusCode == http.StatusOK
-			if resp != nil {
-				resp.Body.Close()
-			}
-
-			prev := b.IsAlive()
-			b.SetAlive(alive)
-			if prev != alive {
-				if alive {
-					log.Printf("🟢 [HEALTH] Backend %s is ONLINE", b.URL)
-				} else {
-					log.Printf("🔴 [HEALTH] Backend %s is OFFLINE (%v)", b.URL, err)
-				}
-			}
-		}
-	}
-}
-
-// isWebSocketRequest checks if an incoming HTTP request is a WebSocket upgrade handshake.
-func isWebSocketRequest(r *http.Request) bool {
-	containsHeader := func(header, value string) bool {
-		for _, v := range strings.Split(header, ",") {
-			if strings.EqualFold(strings.TrimSpace(v), value) {
-				return true
-			}
+	if !b.Alive {
+		if !b.CooldownUntil.IsZero() && time.Now().After(b.CooldownUntil) {
+			return true // Allow retry after cooldown
 		}
 		return false
 	}
-	return containsHeader(r.Header.Get("Connection"), "Upgrade") &&
-		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	return true
 }
 
-// proxyWebSocket performs full-duplex TCP streaming for WebSocket connections.
-func proxyWebSocket(w http.ResponseWriter, r *http.Request, target *Backend) {
-	target.IncrConn()
-	defer target.DecrConn()
-
-	targetHost := target.URL.Host
-
-	// Connect to target backend TCP socket
-	backendConn, err := net.DialTimeout("tcp", targetHost, 5*time.Second)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to dial backend: %v", err), http.StatusServiceUnavailable)
-		return
+func (b *Backend) GetLoadScore() float64 {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+	if !b.Alive {
+		return math.MaxFloat64
 	}
-	defer backendConn.Close()
+	return b.Health.LoadScore
+}
 
-	// Hijack client TCP connection
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
+func (b *Backend) UpdateHealth(h HealthData) {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	b.Health = h
+}
 
-	clientConn, clientBuf, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Hijack failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer clientConn.Close()
+// ─────────────────────────────────────────────────────────────────────────────
+// ServerPool: manages all backends and routing decisions
+// ─────────────────────────────────────────────────────────────────────────────
 
-	// Forward raw handshake request to backend preserving all WebSocket upgrade headers
-	uri := r.URL.RequestURI()
-	if uri == "" {
-		uri = "/ws"
-	}
-	var reqBuilder strings.Builder
-	reqBuilder.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", r.Method, uri))
-	reqBuilder.WriteString(fmt.Sprintf("Host: %s\r\n", targetHost))
+type ServerPool struct {
+	backends  []*Backend
+	threshold float64
+	mu        sync.RWMutex
+}
 
-	hasConnection := false
-	hasUpgrade := false
+// SelectBest returns the backend with the lowest load score, below threshold.
+// Falls back to the least-loaded backend if all are above threshold.
+func (s *ServerPool) SelectBest() *Backend {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	for key, values := range r.Header {
-		if strings.EqualFold(key, "Host") {
+	var best *Backend
+	bestScore := math.MaxFloat64
+
+	var overloaded *Backend
+	overloadedScore := math.MaxFloat64
+
+	for _, b := range s.backends {
+		if !b.IsAvailable() {
 			continue
 		}
-		if strings.EqualFold(key, "Connection") {
-			hasConnection = true
+		score := b.GetLoadScore()
+		if score <= s.threshold {
+			if score < bestScore {
+				bestScore = score
+				best = b
+			}
+		} else {
+			if score < overloadedScore {
+				overloadedScore = score
+				overloaded = b
+			}
 		}
-		if strings.EqualFold(key, "Upgrade") {
-			hasUpgrade = true
-		}
-		for _, value := range values {
-			reqBuilder.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
-		}
 	}
 
-	if !hasConnection {
-		reqBuilder.WriteString("Connection: Upgrade\r\n")
+	if best != nil {
+		return best
 	}
-	if !hasUpgrade {
-		reqBuilder.WriteString("Upgrade: websocket\r\n")
+	if overloaded != nil {
+		log.Printf("[WARN] All backends exceed threshold %.1f. Using least-loaded: %s (%.1f)",
+			s.threshold, overloaded.URL, overloadedScore)
+		return overloaded
 	}
-	reqBuilder.WriteString("\r\n")
-
-	if _, err := backendConn.Write([]byte(reqBuilder.String())); err != nil {
-		log.Printf("Failed to forward WS handshake: %v", err)
-		return
-	}
-
-	// Bi-directional full-duplex streaming
-	errChan := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(backendConn, clientBuf)
-		errChan <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, backendConn)
-		errChan <- err
-	}()
-
-	<-errChan
+	return nil
 }
 
-func main() {
-	port := flag.Int("port", 4209, "Load Balancer listening port (e.g. 4209 for Sys1)")
-	backendsFlag := flag.String("backends", "http://172.17.0.11:4210,http://172.17.0.12:4211,http://172.17.0.13:4212", "Comma-separated backend URLs (Sys2, Sys3, Sys4)")
-	mode := flag.String("mode", "all", "Routing mode: 'single' (only Sys2) or 'all' (Sys2 + Sys3 + Sys4)")
-	algo := flag.String("algo", "leastconn", "Load balancing algorithm: 'leastconn' or 'roundrobin'")
-	flag.Parse()
+// GetAvailable returns all currently alive/available backends.
+func (s *ServerPool) GetAvailable() []*Backend {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var available []*Backend
+	for _, b := range s.backends {
+		if b.IsAvailable() {
+			available = append(available, b)
+		}
+	}
+	return available
+}
 
-	backendURLs := strings.Split(*backendsFlag, ",")
-	if *mode == "single" && len(backendURLs) > 0 {
-		backendURLs = backendURLs[:1]
-		log.Printf("⚡ Running in SINGLE BACKEND mode (Sys2 only): %v", backendURLs)
-	} else {
-		log.Printf("⚡ Running in MULTI BACKEND mode (Sys2 + Sys3 + Sys4): %v", backendURLs)
+// AdaptThreshold auto-adjusts the threshold based on observed load scores.
+func (s *ServerPool) AdaptThreshold() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var scores []float64
+	for _, b := range s.backends {
+		if b.Alive && b.Health.LoadScore > 0 {
+			scores = append(scores, b.Health.LoadScore)
+		}
+	}
+	if len(scores) == 0 {
+		return
+	}
+	var sum float64
+	for _, sc := range scores {
+		sum += sc
+	}
+	avg := sum / float64(len(scores))
+	newThreshold := avg * 1.5
+	if newThreshold < 30 {
+		newThreshold = 30
+	}
+	if newThreshold > 85 {
+		newThreshold = 85
+	}
+	s.threshold = newThreshold
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared HTTP client
+// ─────────────────────────────────────────────────────────────────────────────
+
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health Checking
+// ─────────────────────────────────────────────────────────────────────────────
+
+func healthCheck(pool *ServerPool, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		pool.mu.RLock()
+		backends := append([]*Backend(nil), pool.backends...)
+		pool.mu.RUnlock()
+
+		for _, b := range backends {
+			go func(backend *Backend) {
+				resp, err := httpClient.Get(backend.URL + "/health")
+				if err != nil {
+					wasAlive := backend.Alive
+					backend.SetAlive(false)
+					if wasAlive {
+						log.Printf("[HEALTH] Backend %s OFFLINE: %v", backend.URL, err)
+					}
+					return
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode != http.StatusOK {
+					backend.SetAlive(false)
+					return
+				}
+
+				var h HealthData
+				if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+					backend.SetAlive(false)
+					return
+				}
+
+				wasAlive := backend.Alive
+				backend.SetAlive(true)
+				backend.UpdateHealth(h)
+				if !wasAlive {
+					log.Printf("[HEALTH] Backend %s ONLINE (score: %.1f)", backend.URL, h.LoadScore)
+				}
+			}(b)
+		}
+		pool.AdaptThreshold()
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fan-out write: send the same message to ALL healthy backends simultaneously
+// ─────────────────────────────────────────────────────────────────────────────
+
+func fanOutWrite(pool *ServerPool, msgID, clientName, msgText string) (int, error) {
+	backends := pool.GetAvailable()
+	if len(backends) == 0 {
+		return 0, fmt.Errorf("no available backends")
 	}
 
-	serverPool := &ServerPool{algo: *algo}
+	payload := url.Values{
+		"client-name": {clientName},
+		"msg":         {msgText},
+		"msg_id":      {msgID},
+	}
 
-	for _, rawURL := range backendURLs {
+	type result struct {
+		backendURL string
+		err        error
+	}
+
+	ch := make(chan result, len(backends))
+
+	for _, b := range backends {
+		go func(backend *Backend) {
+			resp, err := httpClient.PostForm(backend.URL+"/message", payload)
+			if err != nil {
+				atomic.AddInt64(&backend.TotalErrors, 1)
+				ch <- result{backend.URL, err}
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode >= 500 {
+				atomic.AddInt64(&backend.TotalErrors, 1)
+				ch <- result{backend.URL, fmt.Errorf("status %d", resp.StatusCode)}
+				return
+			}
+			atomic.AddInt64(&backend.TotalServed, 1)
+			ch <- result{backend.URL, nil}
+		}(b)
+	}
+
+	success := 0
+	var lastErr error
+	for range backends {
+		r := <-ch
+		if r.err != nil {
+			lastErr = r.err
+			log.Printf("[FANOUT] Write to %s failed: %v", r.backendURL, r.err)
+		} else {
+			success++
+		}
+	}
+
+	if success == 0 {
+		return 0, lastErr
+	}
+	return success, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request counters
+// ─────────────────────────────────────────────────────────────────────────────
+
+var (
+	totalRequests int64
+	totalErrors   int64
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP Handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+func makeHandler(pool *ServerPool) http.Handler {
+	mux := http.NewServeMux()
+
+	// ── POST /message ────────────────────────────────────────────────────────
+	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&totalRequests, 1)
+		t0 := time.Now()
+
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var clientName, msgText string
+		ct := r.Header.Get("Content-Type")
+
+		if strings.Contains(ct, "application/json") {
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			clientName = strings.TrimSpace(body["client-name"])
+			msgText = strings.TrimSpace(body["msg"])
+		} else {
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, `{"error":"bad form data"}`, http.StatusBadRequest)
+				return
+			}
+			clientName = strings.TrimSpace(r.FormValue("client-name"))
+			msgText = strings.TrimSpace(r.FormValue("msg"))
+		}
+
+		if clientName == "" {
+			http.Error(w, `{"error":"client-name is required"}`, http.StatusBadRequest)
+			return
+		}
+		if msgText == "" {
+			http.Error(w, `{"error":"msg is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Generate unique ID at the Load Balancer to coordinate all backends
+		msgID := newUUID()
+
+		success, err := fanOutWrite(pool, msgID, clientName, msgText)
+		if success == 0 {
+			atomic.AddInt64(&totalErrors, 1)
+			log.Printf("[ERROR] All backends failed: %v", err)
+			http.Error(w, `{"error":"all backends unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":      "ok",
+			"msg_id":      msgID,
+			"client-name": clientName,
+			"msg":         msgText,
+			"replicated":  success,
+			"latency_ms":  time.Since(t0).Milliseconds(),
+		})
+	})
+
+	// ── GET /feed ─────────────────────────────────────────────────────────────
+	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&totalRequests, 1)
+
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Read from the best (lowest load) available backend
+		target := pool.SelectBest()
+		if target == nil {
+			atomic.AddInt64(&totalErrors, 1)
+			http.Error(w, `{"error":"no available backends"}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		resp, err := httpClient.Get(target.URL + "/feed")
+		if err != nil {
+			// Try any other available backend as fallback
+			for _, b := range pool.GetAvailable() {
+				if b.URL == target.URL {
+					continue
+				}
+				resp, err = httpClient.Get(b.URL + "/feed")
+				if err == nil {
+					break
+				}
+			}
+		}
+		if err != nil {
+			atomic.AddInt64(&totalErrors, 1)
+			http.Error(w, `{"error":"feed unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		defer resp.Body.Close()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+	})
+
+	// ── GET /lb-stats ─────────────────────────────────────────────────────────
+	mux.HandleFunc("/lb-stats", func(w http.ResponseWriter, r *http.Request) {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+
+		stats := make([]map[string]interface{}, 0, len(pool.backends))
+		for _, b := range pool.backends {
+			b.mux.RLock()
+			stats = append(stats, map[string]interface{}{
+				"url":          b.URL,
+				"alive":        b.Alive,
+				"load_score":   b.Health.LoadScore,
+				"cpu_percent":  b.Health.CPUPercent,
+				"memory_pct":   b.Health.MemoryPercent,
+				"active_conns": b.Health.ActiveConnections,
+				"avg_resp_ms":  b.Health.AvgResponseMs,
+				"msg_count":    b.Health.MessageCount,
+				"total_served": b.TotalServed,
+				"total_errors": b.TotalErrors,
+				"consec_fail":  b.ConsecutiveFail,
+			})
+			b.mux.RUnlock()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"threshold":      pool.threshold,
+			"total_requests": atomic.LoadInt64(&totalRequests),
+			"total_errors":   atomic.LoadInt64(&totalErrors),
+			"backends":       stats,
+		})
+	})
+
+	// ── GET /health (LB itself) ───────────────────────────────────────────────
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"role":   "load-balancer",
+		})
+	})
+
+	return mux
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
+
+func main() {
+	port := flag.Int("port", 3210, "Load Balancer listening port")
+	backendsStr := flag.String("backends",
+		"http://172.17.0.11:4210,http://172.17.0.12:3211,http://172.17.0.13:3212",
+		"Comma-separated backend base URLs")
+	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
+	flag.Parse()
+
+	pool := &ServerPool{
+		threshold: *thresholdFlag,
+	}
+
+	for _, rawURL := range strings.Split(*backendsStr, ",") {
 		rawURL = strings.TrimSpace(rawURL)
 		if rawURL == "" {
 			continue
 		}
-		if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-			rawURL = "http://" + rawURL
-		}
-
-		u, err := url.Parse(rawURL)
-		if err != nil {
-			log.Fatalf("Invalid backend URL %s: %v", rawURL, err)
-		}
-
-		proxy := httputil.NewSingleHostReverseProxy(u)
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("Proxy error on %s: %v", u, err)
-			w.WriteHeader(http.StatusBadGateway)
-			fmt.Fprintf(w, "Bad Gateway: %v", err)
-		}
-
-		backend := &Backend{
-			URL:          u,
-			Alive:        true,
-			ReverseProxy: proxy,
-		}
-		serverPool.AddBackend(backend)
-		log.Printf("Registered Backend: %s", u)
+		pool.backends = append(pool.backends, &Backend{
+			URL:   rawURL,
+			Alive: true,
+		})
+		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
-	// Start background health checking
-	go serverPool.HealthCheck(2 * time.Second)
+	// Start background health checker
+	go healthCheck(pool, 2*time.Second)
 
-	// Main Load Balancer HTTP / WebSocket Handler
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Internal stats endpoint for metrics & grading report
-		if r.URL.Path == "/lb-stats" {
-			w.Header().Set("Content-Type", "application/json")
-			serverPool.mux.RLock()
-			stats := make([]map[string]interface{}, len(serverPool.backends))
-			for i, b := range serverPool.backends {
-				stats[i] = map[string]interface{}{
-					"url":          b.URL.String(),
-					"alive":        b.IsAlive(),
-					"active_conns": b.GetActiveConns(),
-					"total_served": b.GetTotalServed(),
-				}
-			}
-			serverPool.mux.RUnlock()
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"mode":      *mode,
-				"algorithm": *algo,
-				"backends":  stats,
-			})
-			return
-		}
-
-		// Select next backend
-		target := serverPool.NextBackend()
-		if target == nil {
-			http.Error(w, "No healthy backend available", http.StatusServiceUnavailable)
-			return
-		}
-
-		// Handle WebSocket upgrades
-		if isWebSocketRequest(r) {
-			log.Printf("🔀 [WS PROXY] Upgrading WebSocket -> %s (Active: %d)", target.URL, target.GetActiveConns()+1)
-			proxyWebSocket(w, r, target)
-			return
-		}
-
-		// Handle standard HTTP requests
-		target.IncrConn()
-		defer target.DecrConn()
-		target.ReverseProxy.ServeHTTP(w, r)
-	})
+	// Brief pause so initial health checks populate metrics
+	time.Sleep(1 * time.Second)
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf("0.0.0.0:%d", *port),
-		Handler: handler,
+		Addr:         fmt.Sprintf("0.0.0.0:%d", *port),
+		Handler:      makeHandler(pool),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("==========================================================")
-	log.Printf("🚀 Go Load Balancer running on http://0.0.0.0:%d", *port)
-	log.Printf("🎯 Algorithm: %s | Mode: %s", *algo, *mode)
-	log.Printf("📊 Live Metrics Endpoint: http://0.0.0.0:%d/lb-stats", *port)
-	log.Printf("==========================================================")
+	log.Printf("==========================================")
+	log.Printf("  Lab 6 Dynamic Load Balancer")
+	log.Printf("  Listening: http://0.0.0.0:%d", *port)
+	log.Printf("  Threshold: %.0f  |  Backends: %d", pool.threshold, len(pool.backends))
+	log.Printf("  Routes: POST /message  GET /feed  GET /lb-stats")
+	log.Printf("==========================================")
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }

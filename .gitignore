@@ -7,3 +7,12 @@ __pycache__/
 SUBMISSION_REPORT.md
 REPORT_TEMPLATE.md
 Report_12341330_Lekkala_Sashank.docx
+scripts/
+*.sh
+generate_docx_report.py
+benchmark/
+cipher-test.py
+key-tampering.py
+*.log
+load_balancer/lb_bin
+load_balancer/go.sum
