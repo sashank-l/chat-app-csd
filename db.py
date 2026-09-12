@@ -19,6 +19,8 @@ def get_conn():
         conn.execute("PRAGMA cache_size=50000")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA wal_autocheckpoint=10000")
+        conn.execute("PRAGMA journal_size_limit=67108864")
         _local.conn = conn
     return _local.conn
 

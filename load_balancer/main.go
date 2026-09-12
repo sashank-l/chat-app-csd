@@ -56,6 +56,7 @@ type Backend struct {
 	Health          HealthData
 	TotalServed     int64
 	TotalErrors     int64
+	ActiveInFlight  int64
 	mux             sync.RWMutex
 }
 
@@ -87,6 +88,17 @@ func (b *Backend) IsAvailable() bool {
 	return true
 }
 
+func (b *Backend) GetEffectiveScore() float64 {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+	if !b.Alive {
+		return math.MaxFloat64
+	}
+	inflight := atomic.LoadInt64(&b.ActiveInFlight)
+	// Base load score + 2.0 penalty per concurrent in-flight request
+	return b.Health.LoadScore + float64(inflight)*2.0
+}
+
 func (b *Backend) GetLoadScore() float64 {
 	b.mux.RLock()
 	defer b.mux.RUnlock()
@@ -112,7 +124,7 @@ type ServerPool struct {
 	mu        sync.RWMutex
 }
 
-// SelectBest picks the backend with lowest load score.
+// SelectBest picks the backend with lowest effective load score (health + in-flight).
 // If all exceed threshold, picks least loaded.
 // Never returns nil if any backend exists.
 func (s *ServerPool) SelectBest() *Backend {
@@ -129,7 +141,7 @@ func (s *ServerPool) SelectBest() *Backend {
 		if !b.IsAvailable() {
 			continue
 		}
-		score := b.GetLoadScore()
+		score := b.GetEffectiveScore()
 		if score <= s.threshold {
 			if score < bestScore {
 				bestScore = score
@@ -271,6 +283,9 @@ func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, 
 	if target == nil {
 		return "", fmt.Errorf("no backends available")
 	}
+
+	atomic.AddInt64(&target.ActiveInFlight, 1)
+	defer atomic.AddInt64(&target.ActiveInFlight, -1)
 
 	payload := url.Values{
 		"client-name": {clientName},
