@@ -415,14 +415,14 @@ func makeHandler(pool *ServerPool) http.Handler {
 		var jsonBody map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &jsonBody); err == nil && len(jsonBody) > 0 {
 			if v, ok := jsonBody["client-name"]; ok {
-				clientName = strings.TrimSpace(fmt.Sprint(v))
+				clientName = fmt.Sprint(v)
 			} else if v, ok := jsonBody["username"]; ok {
-				clientName = strings.TrimSpace(fmt.Sprint(v))
+				clientName = fmt.Sprint(v)
 			}
 			if v, ok := jsonBody["msg"]; ok {
-				msgText = strings.TrimSpace(fmt.Sprint(v))
+				msgText = fmt.Sprint(v)
 			} else if v, ok := jsonBody["text"]; ok {
-				msgText = strings.TrimSpace(fmt.Sprint(v))
+				msgText = fmt.Sprint(v)
 			}
 		}
 
@@ -431,15 +431,15 @@ func makeHandler(pool *ServerPool) http.Handler {
 			vals, err := url.ParseQuery(string(bodyBytes))
 			if err == nil && len(vals) > 0 {
 				if clientName == "" {
-					clientName = strings.TrimSpace(vals.Get("client-name"))
+					clientName = vals.Get("client-name")
 					if clientName == "" {
-						clientName = strings.TrimSpace(vals.Get("username"))
+						clientName = vals.Get("username")
 					}
 				}
 				if msgText == "" {
-					msgText = strings.TrimSpace(vals.Get("msg"))
+					msgText = vals.Get("msg")
 					if msgText == "" {
-						msgText = strings.TrimSpace(vals.Get("text"))
+						msgText = vals.Get("text")
 					}
 				}
 			}

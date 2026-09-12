@@ -23,6 +23,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 4210
 
 app = Flask(__name__, static_folder="static", static_url_path="")
+app.config["JSON_AS_ASCII"] = False
 sock = Sock(app)
 
 # WebSocket clients (kept for browser UI compatibility)
@@ -181,8 +182,8 @@ def post_message():
             if not data:
                 data = request.get_json(silent=True) or {}
 
-        client_name = str(data.get("client-name") or data.get("username") or "").strip()
-        msg_text = str(data.get("msg") or data.get("text") or "").strip()
+        client_name = str(data.get("client-name") or data.get("username") or "")
+        msg_text = str(data.get("msg") or data.get("text") or "")
         msg_id = str(data.get("msg_id") or data.get("id") or "").strip()
 
         if not client_name:
