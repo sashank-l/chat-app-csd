@@ -60,20 +60,38 @@ type Backend struct {
 	mux             sync.RWMutex
 }
 
+func (b *Backend) RecordFailure() {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	b.ConsecutiveFail++
+	if b.ConsecutiveFail >= 3 {
+		b.Alive = false
+		b.CooldownUntil = time.Now().Add(5 * time.Second)
+	}
+}
+
+func (b *Backend) RecordSuccess() {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	b.ConsecutiveFail = 0
+	b.Alive = true
+	b.CooldownUntil = time.Time{}
+}
+
 func (b *Backend) SetAlive(alive bool) {
 	b.mux.Lock()
 	defer b.mux.Unlock()
 	if !alive {
 		b.ConsecutiveFail++
-		if b.ConsecutiveFail >= 3 {
-			// Short cooldown (3s) so temporary spikes don't lock out backends
+		if b.ConsecutiveFail >= 2 {
+			b.Alive = false
 			b.CooldownUntil = time.Now().Add(3 * time.Second)
 		}
 	} else {
 		b.ConsecutiveFail = 0
+		b.Alive = true
 		b.CooldownUntil = time.Time{}
 	}
-	b.Alive = alive
 }
 
 func (b *Backend) IsAvailable() bool {
@@ -216,6 +234,15 @@ var httpClient = &http.Client{
 	},
 }
 
+var feedHttpClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     60 * time.Second,
+	},
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Background Replication Queue
 // Replicates messages asynchronously to peer backends without slowing clients.
@@ -300,7 +327,7 @@ func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, 
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
-		target.SetAlive(false)
+		target.RecordFailure()
 		atomic.AddInt64(&target.TotalErrors, 1)
 
 		// Fallback: try any other backend
@@ -331,22 +358,16 @@ func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, 
 
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	target.RecordSuccess()
 	atomic.AddInt64(&target.TotalServed, 1)
 
-	// Enqueue asynchronous replication to all other backends
+	// Enqueue asynchronous replication to all other backends (best-effort, no blocking)
 	for _, b := range pool.GetAll() {
 		if b.URL != target.URL {
 			select {
 			case replicationCh <- ReplicationTask{BackendURL: b.URL, Payload: payload}:
 			default:
-				// If queue full, launch goroutine
-				go func(u string) {
-					r, e := httpClient.PostForm(u+"/message", payload)
-					if e == nil {
-						io.Copy(io.Discard, r.Body)
-						r.Body.Close()
-					}
-				}(b.URL)
+				// If queue full, discard to protect backend concurrency
 			}
 		}
 	}
@@ -472,7 +493,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		for _, b := range backends {
 			go func(backendURL string) {
-				resp, err := httpClient.Get(backendURL + "/feed")
+				resp, err := feedHttpClient.Get(backendURL + "/feed")
 				if err != nil || resp.StatusCode != http.StatusOK {
 					if resp != nil {
 						resp.Body.Close()
@@ -489,11 +510,11 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		// Collect and merge messages from all backends
 		seen := make(map[string]bool)
-		var merged []FeedMessage
+		merged := make([]FeedMessage, 0)
 
 		for range backends {
 			res := <-ch
-			if res.err == nil {
+			if res.err == nil && res.msgs != nil {
 				for _, m := range res.msgs {
 					key := m.ID
 					if key == "" {
