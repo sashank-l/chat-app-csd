@@ -225,7 +225,7 @@ func (s *ServerPool) AdaptThreshold() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{
-	Timeout: 3 * time.Second,
+	Timeout: 1500 * time.Millisecond,
 	Transport: &http.Transport{
 		MaxIdleConns:        10000,
 		MaxIdleConnsPerHost: 2000,

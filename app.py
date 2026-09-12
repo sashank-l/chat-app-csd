@@ -2,6 +2,10 @@ import argparse
 import json
 import os
 import threading
+try:
+    threading.stack_size(256 * 1024)
+except Exception:
+    pass
 import time
 
 try:
@@ -145,6 +149,8 @@ _hash_chain_lock = threading.Lock()
 def get_or_create_keypair(username):
     with _keypair_lock:
         if username not in _keypair_cache:
+            if len(_keypair_cache) > 1000:
+                _keypair_cache.clear()
             priv, pub = signatures.generate_keypair()
             pem = signatures.public_key_to_pem(pub)
             _keypair_cache[username] = (priv, pem)

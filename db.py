@@ -3,32 +3,35 @@ import sqlite3
 import threading
 
 DB_PATH = "chat.db"
-_local = threading.local()
-_pid = None
+_conn = None
+_conn_pid = None
+_db_lock = threading.Lock()
 _seen_msg_ids = set()
 _seen_lock = threading.Lock()
-_db_write_lock = threading.Lock()
 
 
 def get_conn():
     """
     Get or create process-safe and thread-safe SQLite connection.
     Detects os.getpid() changes after Gunicorn fork to prevent SQLite deadlocks.
+    Uses ONE connection per process to avoid multi-thread RAM bloat.
     """
-    global _pid
+    global _conn, _conn_pid
     cur_pid = os.getpid()
-    if not hasattr(_local, "conn") or _local.conn is None or _local.pid != cur_pid:
-        conn = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=OFF")
-        conn.execute("PRAGMA cache_size=-4000")
-        conn.execute("PRAGMA temp_store=FILE")
-        conn.execute("PRAGMA busy_timeout=60000")
-        conn.execute("PRAGMA wal_autocheckpoint=500")
-        _local.conn = conn
-        _local.pid = cur_pid
-    return _local.conn
+    if _conn is None or _conn_pid != cur_pid:
+        with _db_lock:
+            if _conn is None or _conn_pid != cur_pid:
+                c = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
+                c.row_factory = sqlite3.Row
+                c.execute("PRAGMA journal_mode=WAL")
+                c.execute("PRAGMA synchronous=OFF")
+                c.execute("PRAGMA cache_size=-1000")
+                c.execute("PRAGMA temp_store=FILE")
+                c.execute("PRAGMA busy_timeout=60000")
+                c.execute("PRAGMA wal_autocheckpoint=500")
+                _conn = c
+                _conn_pid = cur_pid
+    return _conn
 
 
 def init_db():
@@ -69,11 +72,12 @@ def init_db():
 
 def get_last_hash() -> str:
     """Tail of the hash chain — needed so the next message can link to it."""
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT record_hash FROM messages ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    return row["record_hash"] if row else "0" * 64
+    with _db_lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT record_hash FROM messages ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["record_hash"] if row else "0" * 64
 
 
 def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash) -> bool:
@@ -87,7 +91,7 @@ def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk,
             return False
         _seen_msg_ids.add(msg_id)
 
-    with _db_write_lock:
+    with _db_lock:
         conn = get_conn()
         cursor = conn.execute(
             """INSERT OR IGNORE INTO messages
@@ -101,11 +105,12 @@ def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk,
 
 def load_history(limit=100000):
     """Load all messages ordered by insertion id."""
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM messages ORDER BY id ASC LIMIT ?", (limit,)
-    ).fetchall()
-    return [dict(r) for r in rows]
+    with _db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT * FROM messages ORDER BY id ASC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_messages_for_feed():
@@ -113,19 +118,20 @@ def get_messages_for_feed():
     Returns messages in the exact format needed for /feed.
     Returns all messages in insertion order without artificial limit.
     """
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT msg_id, username, plaintext, timestamp FROM messages ORDER BY id ASC"
-    ).fetchall()
-    return [
-        {
-            "id": row["msg_id"],
-            "client-name": row["username"],
-            "msg": row["plaintext"],
-            "timestamp": row["timestamp"]
-        }
-        for row in rows
-    ]
+    with _db_lock:
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT msg_id, username, plaintext, timestamp FROM messages ORDER BY id ASC"
+        ).fetchall()
+        return [
+            {
+                "id": row["msg_id"],
+                "client-name": row["username"],
+                "msg": row["plaintext"],
+                "timestamp": row["timestamp"]
+            }
+            for row in rows
+        ]
 
 
 def message_exists(msg_id: str) -> bool:
@@ -141,10 +147,11 @@ def get_message_count() -> int:
 
 
 def upsert_user_pubkey(username, pubkey_jwk_str):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO users (username, pubkey_jwk) VALUES (?, ?) "
-        "ON CONFLICT(username) DO UPDATE SET pubkey_jwk = excluded.pubkey_jwk",
-        (username, pubkey_jwk_str)
-    )
-    conn.commit()
+    with _db_lock:
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO users (username, pubkey_jwk) VALUES (?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET pubkey_jwk = excluded.pubkey_jwk",
+            (username, pubkey_jwk_str)
+        )
+        conn.commit()
