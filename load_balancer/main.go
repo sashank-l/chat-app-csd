@@ -225,11 +225,11 @@ func (s *ServerPool) AdaptThreshold() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{
-	Timeout: 5 * time.Second,
+	Timeout: 3 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        5000,
-		MaxIdleConnsPerHost: 1000,
-		IdleConnTimeout:     60 * time.Second,
+		MaxIdleConns:        10000,
+		MaxIdleConnsPerHost: 2000,
+		IdleConnTimeout:     90 * time.Second,
 		DisableKeepAlives:   false,
 	},
 }
@@ -360,17 +360,6 @@ func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, 
 	resp.Body.Close()
 	target.RecordSuccess()
 	atomic.AddInt64(&target.TotalServed, 1)
-
-	// Enqueue asynchronous replication to all other backends (best-effort, no blocking)
-	for _, b := range pool.GetAll() {
-		if b.URL != target.URL {
-			select {
-			case replicationCh <- ReplicationTask{BackendURL: b.URL, Payload: payload}:
-			default:
-				// If queue full, discard to protect backend concurrency
-			}
-		}
-	}
 
 	return target.URL, nil
 }
@@ -611,9 +600,6 @@ func main() {
 		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
-	// Start 8 background async replication workers
-	startReplicationWorkers(8)
-
 	// Start background health checker
 	go healthCheck(pool, 2*time.Second)
 
@@ -627,8 +613,8 @@ func main() {
 			s3000 := &http.Server{
 				Addr:         "0.0.0.0:3000",
 				Handler:      handler,
-				ReadTimeout:  15 * time.Second,
-				WriteTimeout: 30 * time.Second,
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 15 * time.Second,
 				IdleTimeout:  60 * time.Second,
 			}
 			log.Printf("[DUAL] Also listening on http://0.0.0.0:3000")
@@ -641,8 +627,8 @@ func main() {
 	server := &http.Server{
 		Addr:         fmt.Sprintf("0.0.0.0:%d", *port),
 		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 

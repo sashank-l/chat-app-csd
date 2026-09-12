@@ -7,6 +7,7 @@ _local = threading.local()
 _pid = None
 _seen_msg_ids = set()
 _seen_lock = threading.Lock()
+_db_write_lock = threading.Lock()
 
 
 def get_conn():
@@ -17,13 +18,14 @@ def get_conn():
     global _pid
     cur_pid = os.getpid()
     if not hasattr(_local, "conn") or _local.conn is None or _local.pid != cur_pid:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+        conn = sqlite3.connect(DB_PATH, timeout=60.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA synchronous=OFF")
         conn.execute("PRAGMA cache_size=50000")
         conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA wal_autocheckpoint=10000")
         _local.conn = conn
         _local.pid = cur_pid
     return _local.conn
@@ -31,10 +33,10 @@ def get_conn():
 
 def init_db():
     global _seen_msg_ids
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = sqlite3.connect(DB_PATH, timeout=60.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA synchronous=OFF")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,15 +87,16 @@ def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk,
             return False
         _seen_msg_ids.add(msg_id)
 
-    conn = get_conn()
-    cursor = conn.execute(
-        """INSERT OR IGNORE INTO messages
-           (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
-    )
-    conn.commit()
-    return cursor.rowcount > 0
+    with _db_write_lock:
+        conn = get_conn()
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO messages
+               (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def load_history(limit=100000):
