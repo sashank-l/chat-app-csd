@@ -22,10 +22,10 @@ def get_conn():
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=OFF")
-        conn.execute("PRAGMA cache_size=50000")
-        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-4000")
+        conn.execute("PRAGMA temp_store=FILE")
         conn.execute("PRAGMA busy_timeout=60000")
-        conn.execute("PRAGMA wal_autocheckpoint=10000")
+        conn.execute("PRAGMA wal_autocheckpoint=500")
         _local.conn = conn
         _local.pid = cur_pid
     return _local.conn
