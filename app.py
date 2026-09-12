@@ -404,7 +404,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Secure Chat Backend — Lab 6")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--also-port", type=int, default=0, help="Optional second port to serve concurrently")
     args = parser.parse_args()
+
+    if args.also_port and args.also_port != args.port:
+        import threading
+        from werkzeug.serving import run_simple
+        t = threading.Thread(
+            target=run_simple,
+            args=(args.host, args.also_port, app),
+            kwargs={"threaded": True},
+            daemon=True
+        )
+        t.start()
+        print(f"[backend] Also listening on http://{args.host}:{args.also_port}")
 
     print(f"[backend] Listening on http://{args.host}:{args.port}")
     print(f"[backend] REST API: POST /message   GET /feed   GET /health")

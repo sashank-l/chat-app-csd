@@ -545,9 +545,28 @@ func main() {
 	// Brief pause so initial health checks populate metrics
 	time.Sleep(1 * time.Second)
 
+	handler := makeHandler(pool)
+
+	// Also listen on port 3000 if not already the main port
+	if *port != 3000 {
+		go func() {
+			s3000 := &http.Server{
+				Addr:         "0.0.0.0:3000",
+				Handler:      handler,
+				ReadTimeout:  15 * time.Second,
+				WriteTimeout: 30 * time.Second,
+				IdleTimeout:  60 * time.Second,
+			}
+			log.Printf("[DUAL] Also listening on http://0.0.0.0:3000")
+			if err := s3000.ListenAndServe(); err != nil {
+				log.Printf("[DUAL] Port 3000 listener: %v", err)
+			}
+		}()
+	}
+
 	server := &http.Server{
 		Addr:         fmt.Sprintf("0.0.0.0:%d", *port),
-		Handler:      makeHandler(pool),
+		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -555,7 +574,7 @@ func main() {
 
 	log.Printf("==========================================")
 	log.Printf("  Lab 6 Dynamic Load Balancer")
-	log.Printf("  Listening: http://0.0.0.0:%d", *port)
+	log.Printf("  Listening: http://0.0.0.0:%d and http://0.0.0.0:3000", *port)
 	log.Printf("  Threshold: %.0f  |  Backends: %d", pool.threshold, len(pool.backends))
 	log.Printf("  Routes: POST /message  GET /feed  GET /lb-stats")
 	log.Printf("==========================================")
