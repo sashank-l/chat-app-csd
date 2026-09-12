@@ -1,3 +1,4 @@
+import json
 import os
 import queue
 import sqlite3
@@ -124,18 +125,10 @@ def init_db():
     ).fetchall()
 
     with _seen_lock:
-        _seen_msg_ids = {r["msg_id"] for r in rows}
+        _seen_msg_ids = {r[0] for r in rows}
 
     with _feed_lock:
-        _memory_feed = [
-            {
-                "id": r["msg_id"],
-                "client-name": r["username"],
-                "msg": r["plaintext"],
-                "timestamp": r["timestamp"]
-            }
-            for r in rows
-        ]
+        _memory_feed = [(r[0], r[1], r[2], r[3]) for r in rows]
 
     conn.close()
     ensure_writer_started()
@@ -164,14 +157,9 @@ def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk,
             return False
         _seen_msg_ids.add(msg_id)
 
-    feed_item = {
-        "id": msg_id,
-        "client-name": username,
-        "msg": plaintext,
-        "timestamp": timestamp
-    }
+    feed_tuple = (msg_id, username, plaintext, timestamp)
     with _feed_lock:
-        _memory_feed.append(feed_item)
+        _memory_feed.append(feed_tuple)
 
     db_tuple = (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
     try:
@@ -195,11 +183,11 @@ def load_history(limit=100000):
     with _feed_lock:
         return [
             {
-                "username": m["client-name"],
-                "plaintext": m["msg"],
-                "timestamp": m["timestamp"]
+                "username": t[1],
+                "plaintext": t[2],
+                "timestamp": t[3]
             }
-            for m in _memory_feed[:limit]
+            for t in _memory_feed[:limit]
         ]
 
 
@@ -209,7 +197,47 @@ def get_messages_for_feed():
     Served directly from in-memory cache in < 1ms!
     """
     with _feed_lock:
-        return list(_memory_feed)
+        return [
+            {
+                "id": t[0],
+                "client-name": t[1],
+                "msg": t[2],
+                "timestamp": t[3]
+            }
+            for t in _memory_feed
+        ]
+
+
+def get_feed_json() -> str:
+    """
+    Directly serialize in-memory feed to JSON string with minimal RAM overhead.
+    """
+    with _feed_lock:
+        items = [
+            {
+                "id": t[0],
+                "client-name": t[1],
+                "msg": t[2],
+                "timestamp": t[3]
+            }
+            for t in _memory_feed
+        ]
+        return json.dumps(items)
+
+
+def reset_db():
+    """Clear messages table, reset hash chain, and clean memory cache."""
+    global _seen_msg_ids, _memory_feed
+    with _db_lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='messages'")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    with _seen_lock:
+        _seen_msg_ids = set()
+    with _feed_lock:
+        _memory_feed = []
 
 
 def message_exists(msg_id: str) -> bool:

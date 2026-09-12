@@ -14,7 +14,7 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_sock import Sock
 
 import db
@@ -281,11 +281,18 @@ def get_feed():
     """
     t_start = time.perf_counter()
     try:
-        messages = db.get_messages_for_feed()
-        return jsonify(messages), 200
+        data = db.get_feed_json()
+        return Response(data, mimetype="application/json", status=200)
     finally:
         elapsed = (time.perf_counter() - t_start) * 1000
         track_response_time(elapsed)
+
+
+@app.route("/reset-state", methods=["POST"])
+def reset_state():
+    """Reset messages database and memory cache for a clean benchmark run."""
+    db.reset_db()
+    return jsonify({"status": "ok", "message": "database reset complete"}), 200
 
 
 # ─────────────────────────────────────────────
