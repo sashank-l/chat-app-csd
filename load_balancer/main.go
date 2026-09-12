@@ -577,9 +577,9 @@ func makeHandler(pool *ServerPool) http.Handler {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
-	port := flag.Int("port", 3210, "Load Balancer listening port")
+	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
-		"http://172.17.0.11:4210,http://172.17.0.12:3000,http://172.17.0.13:3000",
+		"http://172.17.0.11:4000,http://172.17.0.12:3000,http://172.17.0.13:3000",
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
 	flag.Parse()
@@ -607,25 +607,23 @@ func main() {
 
 	handler := makeHandler(pool)
 
-	// Also listen on port 3000 if not the primary port
-	if *port != 3000 {
-		go func() {
-			s3000 := &http.Server{
-				Addr:         "0.0.0.0:3000",
-				Handler:      handler,
-				ReadTimeout:  10 * time.Second,
-				WriteTimeout: 15 * time.Second,
-				IdleTimeout:  60 * time.Second,
-			}
-			log.Printf("[DUAL] Also listening on http://0.0.0.0:3000")
-			if err := s3000.ListenAndServe(); err != nil {
-				log.Printf("[DUAL] Port 3000 listener stopped: %v", err)
-			}
-		}()
-	}
+	// Ensure LB listens on BOTH port 3000 and port 3210
+	go func() {
+		sDual := &http.Server{
+			Addr:         "0.0.0.0:3210",
+			Handler:      handler,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		log.Printf("[DUAL] Also listening on http://0.0.0.0:3210")
+		if err := sDual.ListenAndServe(); err != nil {
+			log.Printf("[DUAL] Port 3210 listener: %v", err)
+		}
+	}()
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf("0.0.0.0:%d", *port),
+		Addr:         "0.0.0.0:3000",
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
