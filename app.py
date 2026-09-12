@@ -126,6 +126,31 @@ def health():
 # REST API Routes: /message and /feed
 # ─────────────────────────────────────────────
 
+# Caching for high-throughput ECDSA signing and hash chain
+_keypair_cache = {}
+_keypair_lock = threading.Lock()
+_last_hash_val = db.get_last_hash()
+_hash_chain_lock = threading.Lock()
+
+
+def get_or_create_keypair(username):
+    with _keypair_lock:
+        if username not in _keypair_cache:
+            priv, pub = signatures.generate_keypair()
+            pem = signatures.public_key_to_pem(pub)
+            _keypair_cache[username] = (priv, pem)
+        return _keypair_cache[username]
+
+
+def get_next_hashes(client_name, ciphertext, signature, timestamp):
+    global _last_hash_val
+    with _hash_chain_lock:
+        prev = _last_hash_val
+        rec = integrity.compute_record_hash(prev, client_name, ciphertext, signature, timestamp)
+        _last_hash_val = rec
+        return prev, rec
+
+
 @app.route("/message", methods=["POST"])
 def post_message():
     """
@@ -173,9 +198,8 @@ def post_message():
 
         timestamp = int(time.time() * 1000)
 
-        # Generate ECDSA keypair for this message (keeps security from Lab 5)
-        private_key, public_key = signatures.generate_keypair()
-        public_key_pem = signatures.public_key_to_pem(public_key)
+        # Retrieve or generate ECDSA keypair for this sender
+        private_key, public_key_pem = get_or_create_keypair(client_name)
 
         # Canonical message for signing
         msg_str = f"{client_name}|{msg_text}|{timestamp}"
@@ -186,11 +210,8 @@ def post_message():
         # Encrypt the message for storage
         ciphertext = crypto_utils.encrypt_text(msg_text)
 
-        # Build hash chain
-        prev_hash = db.get_last_hash()
-        record_hash = integrity.compute_record_hash(
-            prev_hash, client_name, ciphertext, signature, timestamp
-        )
+        # Link to hash chain
+        prev_hash, record_hash = get_next_hashes(client_name, ciphertext, signature, timestamp)
 
         # Store in DB — INSERT OR IGNORE ensures no duplicates
         inserted = db.save_message(
@@ -205,8 +226,8 @@ def post_message():
             record_hash=record_hash
         )
 
-        # Broadcast over WebSocket to any connected browser clients
-        if inserted:
+        # Broadcast over WebSocket only if browser clients are connected
+        if inserted and clients:
             try:
                 _broadcast_ws({
                     "type": "message",

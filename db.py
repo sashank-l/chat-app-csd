@@ -11,6 +11,8 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=10000")
+    conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 
@@ -81,15 +83,14 @@ def load_history(limit=10000):
         return [dict(r) for r in rows]
 
 
-def get_messages_for_feed(limit=10000):
+def get_messages_for_feed():
     """
     Returns messages in the exact format needed for /feed.
-    Returns list of dicts with 'client-name' and 'msg' keys.
+    Returns all messages in insertion order without artificial limit.
     """
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT msg_id, username, plaintext, timestamp FROM messages ORDER BY id ASC LIMIT ?",
-            (limit,)
+            "SELECT msg_id, username, plaintext, timestamp FROM messages ORDER BY id ASC"
         ).fetchall()
         return [
             {

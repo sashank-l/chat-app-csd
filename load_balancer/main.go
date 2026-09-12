@@ -194,15 +194,15 @@ func (s *ServerPool) AdaptThreshold() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared HTTP client
+// Shared HTTP client with high connection pool for concurrency
 // ─────────────────────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 50,
-		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:        5000,
+		MaxIdleConnsPerHost: 1000,
+		IdleConnTimeout:     60 * time.Second,
 	},
 }
 
@@ -255,7 +255,9 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fan-out write: send the same message to ALL healthy backends simultaneously
+// Fan-out write: writes to all healthy backends
+// Returns as soon as the FIRST backend confirms write (fastest client response),
+// while background goroutines replicate to the remaining backends.
 // ─────────────────────────────────────────────────────────────────────────────
 
 func fanOutWrite(pool *ServerPool, msgID, clientName, msgText string) (int, error) {
@@ -270,49 +272,58 @@ func fanOutWrite(pool *ServerPool, msgID, clientName, msgText string) (int, erro
 		"msg_id":      {msgID},
 	}
 
-	type result struct {
-		backendURL string
-		err        error
-	}
-
-	ch := make(chan result, len(backends))
+	firstSuccess := make(chan struct{}, 1)
+	var replicatedCount int64
+	var lastErr error
+	var errMu sync.Mutex
 
 	for _, b := range backends {
 		go func(backend *Backend) {
 			resp, err := httpClient.PostForm(backend.URL+"/message", payload)
 			if err != nil {
 				atomic.AddInt64(&backend.TotalErrors, 1)
-				ch <- result{backend.URL, err}
+				errMu.Lock()
+				lastErr = err
+				errMu.Unlock()
 				return
 			}
 			defer resp.Body.Close()
 			io.Copy(io.Discard, resp.Body)
-			if resp.StatusCode >= 500 {
+
+			if resp.StatusCode >= 400 {
 				atomic.AddInt64(&backend.TotalErrors, 1)
-				ch <- result{backend.URL, fmt.Errorf("status %d", resp.StatusCode)}
+				errMu.Lock()
+				lastErr = fmt.Errorf("status %d", resp.StatusCode)
+				errMu.Unlock()
 				return
 			}
+
 			atomic.AddInt64(&backend.TotalServed, 1)
-			ch <- result{backend.URL, nil}
+			count := atomic.AddInt64(&replicatedCount, 1)
+			if count == 1 {
+				select {
+				case firstSuccess <- struct{}{}:
+				default:
+				}
+			}
 		}(b)
 	}
 
-	success := 0
-	var lastErr error
-	for range backends {
-		r := <-ch
-		if r.err != nil {
-			lastErr = r.err
-			log.Printf("[FANOUT] Write to %s failed: %v", r.backendURL, r.err)
-		} else {
-			success++
+	select {
+	case <-firstSuccess:
+		return int(atomic.LoadInt64(&replicatedCount)), nil
+	case <-time.After(8 * time.Second):
+		count := int(atomic.LoadInt64(&replicatedCount))
+		if count > 0 {
+			return count, nil
 		}
+		errMu.Lock()
+		defer errMu.Unlock()
+		if lastErr != nil {
+			return 0, lastErr
+		}
+		return 0, fmt.Errorf("all writes failed or timed out")
 	}
-
-	if success == 0 {
-		return 0, lastErr
-	}
-	return success, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -342,23 +353,40 @@ func makeHandler(pool *ServerPool) http.Handler {
 		}
 
 		var clientName, msgText string
-		ct := r.Header.Get("Content-Type")
+		bodyBytes, _ := io.ReadAll(r.Body)
 
-		if strings.Contains(ct, "application/json") {
-			var body map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-				return
+		// 1. Try JSON decode
+		var jsonBody map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &jsonBody); err == nil && len(jsonBody) > 0 {
+			if v, ok := jsonBody["client-name"]; ok {
+				clientName = strings.TrimSpace(fmt.Sprint(v))
+			} else if v, ok := jsonBody["username"]; ok {
+				clientName = strings.TrimSpace(fmt.Sprint(v))
 			}
-			clientName = strings.TrimSpace(body["client-name"])
-			msgText = strings.TrimSpace(body["msg"])
-		} else {
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, `{"error":"bad form data"}`, http.StatusBadRequest)
-				return
+			if v, ok := jsonBody["msg"]; ok {
+				msgText = strings.TrimSpace(fmt.Sprint(v))
+			} else if v, ok := jsonBody["text"]; ok {
+				msgText = strings.TrimSpace(fmt.Sprint(v))
 			}
-			clientName = strings.TrimSpace(r.FormValue("client-name"))
-			msgText = strings.TrimSpace(r.FormValue("msg"))
+		}
+
+		// 2. If not found, try Form URL-encoded decode
+		if clientName == "" || msgText == "" {
+			vals, err := url.ParseQuery(string(bodyBytes))
+			if err == nil && len(vals) > 0 {
+				if clientName == "" {
+					clientName = strings.TrimSpace(vals.Get("client-name"))
+					if clientName == "" {
+						clientName = strings.TrimSpace(vals.Get("username"))
+					}
+				}
+				if msgText == "" {
+					msgText = strings.TrimSpace(vals.Get("msg"))
+					if msgText == "" {
+						msgText = strings.TrimSpace(vals.Get("text"))
+					}
+				}
+			}
 		}
 
 		if clientName == "" {
@@ -411,20 +439,23 @@ func makeHandler(pool *ServerPool) http.Handler {
 		}
 
 		resp, err := httpClient.Get(target.URL + "/feed")
-		if err != nil {
-			// Try any other available backend as fallback
+		if err != nil || resp.StatusCode != http.StatusOK {
+			// Try other backends as fallback
 			for _, b := range pool.GetAvailable() {
 				if b.URL == target.URL {
 					continue
 				}
 				resp, err = httpClient.Get(b.URL + "/feed")
-				if err == nil {
+				if err == nil && resp.StatusCode == http.StatusOK {
 					break
 				}
 			}
 		}
-		if err != nil {
+		if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
 			atomic.AddInt64(&totalErrors, 1)
+			if resp != nil {
+				resp.Body.Close()
+			}
 			http.Error(w, `{"error":"feed unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
