@@ -225,7 +225,7 @@ func (s *ServerPool) AdaptThreshold() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{
-	Timeout: 5000 * time.Millisecond,
+	Timeout: 12000 * time.Millisecond,
 	Transport: &http.Transport{
 		MaxIdleConns:        10000,
 		MaxIdleConnsPerHost: 2000,
@@ -306,23 +306,31 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, error) {
-	target := pool.SelectBest()
-	if target == nil {
-		return "", fmt.Errorf("no backends available")
-	}
-
-	atomic.AddInt64(&target.ActiveInFlight, 1)
-	defer atomic.AddInt64(&target.ActiveInFlight, -1)
-
 	payload := url.Values{
 		"client-name": {clientName},
 		"msg":         {msgText},
 		"msg_id":      {msgID},
 	}
 
-	// Try target backend first
-	resp, err := httpClient.PostForm(target.URL+"/message", payload)
-	if err != nil || resp.StatusCode >= 400 {
+	for attempt := 0; attempt < 3; attempt++ {
+		target := pool.SelectBest()
+		if target == nil {
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+
+		atomic.AddInt64(&target.ActiveInFlight, 1)
+		resp, err := httpClient.PostForm(target.URL+"/message", payload)
+		atomic.AddInt64(&target.ActiveInFlight, -1)
+
+		if err == nil && resp != nil && resp.StatusCode < 400 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			target.RecordSuccess()
+			atomic.AddInt64(&target.TotalServed, 1)
+			return target.URL, nil
+		}
+
 		if resp != nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
@@ -330,38 +338,12 @@ func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, 
 		target.RecordFailure()
 		atomic.AddInt64(&target.TotalErrors, 1)
 
-		// Fallback: try any other backend
-		backends := pool.GetAll()
-		for _, alt := range backends {
-			if alt.URL == target.URL {
-				continue
-			}
-			resp, err = httpClient.PostForm(alt.URL+"/message", payload)
-			if err == nil && resp.StatusCode < 400 {
-				target = alt
-				break
-			}
-			if resp != nil {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-			}
+		if attempt < 2 {
+			time.Sleep(30 * time.Millisecond)
 		}
 	}
 
-	if err != nil || resp == nil || resp.StatusCode >= 400 {
-		if resp != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-		return "", fmt.Errorf("backend rejected message")
-	}
-
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	target.RecordSuccess()
-	atomic.AddInt64(&target.TotalServed, 1)
-
-	return target.URL, nil
+	return "", fmt.Errorf("all backends busy")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
