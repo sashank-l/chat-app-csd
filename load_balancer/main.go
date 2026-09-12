@@ -9,8 +9,10 @@ import (
 	"io"
 	"log"
 	"math"
+	mrand "math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,8 +23,8 @@ import (
 func newUUID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%s-%s-%s-%s-%s",
 		hex.EncodeToString(b[0:4]),
 		hex.EncodeToString(b[4:6]),
@@ -33,7 +35,7 @@ func newUUID() string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Backend struct: tracks a single backend's health and metrics
+// Backend struct: tracks health and dynamic metrics
 // ─────────────────────────────────────────────────────────────────────────────
 
 type HealthData struct {
@@ -63,8 +65,8 @@ func (b *Backend) SetAlive(alive bool) {
 	if !alive {
 		b.ConsecutiveFail++
 		if b.ConsecutiveFail >= 3 {
-			b.CooldownUntil = time.Now().Add(60 * time.Second)
-			log.Printf("[CIRCUIT BREAKER] %s in cooldown for 60s", b.URL)
+			// Short cooldown (3s) so temporary spikes don't lock out backends
+			b.CooldownUntil = time.Now().Add(3 * time.Second)
 		}
 	} else {
 		b.ConsecutiveFail = 0
@@ -78,7 +80,7 @@ func (b *Backend) IsAvailable() bool {
 	defer b.mux.RUnlock()
 	if !b.Alive {
 		if !b.CooldownUntil.IsZero() && time.Now().After(b.CooldownUntil) {
-			return true // Allow retry after cooldown
+			return true
 		}
 		return false
 	}
@@ -101,7 +103,7 @@ func (b *Backend) UpdateHealth(h HealthData) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ServerPool: manages all backends and routing decisions
+// ServerPool: dynamic performance-based routing
 // ─────────────────────────────────────────────────────────────────────────────
 
 type ServerPool struct {
@@ -110,8 +112,9 @@ type ServerPool struct {
 	mu        sync.RWMutex
 }
 
-// SelectBest returns the backend with the lowest load score, below threshold.
-// Falls back to the least-loaded backend if all are above threshold.
+// SelectBest picks the backend with lowest load score.
+// If all exceed threshold, picks least loaded.
+// Never returns nil if any backend exists.
 func (s *ServerPool) SelectBest() *Backend {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -144,27 +147,21 @@ func (s *ServerPool) SelectBest() *Backend {
 		return best
 	}
 	if overloaded != nil {
-		log.Printf("[WARN] All backends exceed threshold %.1f. Using least-loaded: %s (%.1f)",
-			s.threshold, overloaded.URL, overloadedScore)
 		return overloaded
+	}
+	// Fallback: if all marked down, return random backend to retry
+	if len(s.backends) > 0 {
+		return s.backends[mrand.Intn(len(s.backends))]
 	}
 	return nil
 }
 
-// GetAvailable returns all currently alive/available backends.
-func (s *ServerPool) GetAvailable() []*Backend {
+func (s *ServerPool) GetAll() []*Backend {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var available []*Backend
-	for _, b := range s.backends {
-		if b.IsAvailable() {
-			available = append(available, b)
-		}
-	}
-	return available
+	return append([]*Backend(nil), s.backends...)
 }
 
-// AdaptThreshold auto-adjusts the threshold based on observed load scores.
 func (s *ServerPool) AdaptThreshold() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,16 +191,43 @@ func (s *ServerPool) AdaptThreshold() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared HTTP client with high connection pool for concurrency
+// HTTP Client optimized for 1,000+ concurrent connections
 // ─────────────────────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:        5000,
 		MaxIdleConnsPerHost: 1000,
 		IdleConnTimeout:     60 * time.Second,
+		DisableKeepAlives:   false,
 	},
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background Replication Queue
+// Replicates messages asynchronously to peer backends without slowing clients.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ReplicationTask struct {
+	BackendURL string
+	Payload    url.Values
+}
+
+var replicationCh = make(chan ReplicationTask, 50000)
+
+func startReplicationWorkers(numWorkers int) {
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			for task := range replicationCh {
+				resp, err := httpClient.PostForm(task.BackendURL+"/message", task.Payload)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}()
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -214,39 +238,23 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		pool.mu.RLock()
-		backends := append([]*Backend(nil), pool.backends...)
-		pool.mu.RUnlock()
-
+		backends := pool.GetAll()
 		for _, b := range backends {
 			go func(backend *Backend) {
 				resp, err := httpClient.Get(backend.URL + "/health")
-				if err != nil {
-					wasAlive := backend.Alive
-					backend.SetAlive(false)
-					if wasAlive {
-						log.Printf("[HEALTH] Backend %s OFFLINE: %v", backend.URL, err)
+				if err != nil || resp.StatusCode != http.StatusOK {
+					if resp != nil {
+						resp.Body.Close()
 					}
+					backend.SetAlive(false)
 					return
 				}
 				defer resp.Body.Close()
 
-				if resp.StatusCode != http.StatusOK {
-					backend.SetAlive(false)
-					return
-				}
-
 				var h HealthData
-				if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
-					backend.SetAlive(false)
-					return
-				}
-
-				wasAlive := backend.Alive
-				backend.SetAlive(true)
-				backend.UpdateHealth(h)
-				if !wasAlive {
-					log.Printf("[HEALTH] Backend %s ONLINE (score: %.1f)", backend.URL, h.LoadScore)
+				if err := json.NewDecoder(resp.Body).Decode(&h); err == nil {
+					backend.SetAlive(true)
+					backend.UpdateHealth(h)
 				}
 			}(b)
 		}
@@ -255,15 +263,13 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fan-out write: writes to all healthy backends
-// Returns as soon as the FIRST backend confirms write (fastest client response),
-// while background goroutines replicate to the remaining backends.
+// Route message to best backend, then queue async replication
 // ─────────────────────────────────────────────────────────────────────────────
 
-func fanOutWrite(pool *ServerPool, msgID, clientName, msgText string) (int, error) {
-	backends := pool.GetAvailable()
-	if len(backends) == 0 {
-		return 0, fmt.Errorf("no available backends")
+func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, error) {
+	target := pool.SelectBest()
+	if target == nil {
+		return "", fmt.Errorf("no backends available")
 	}
 
 	payload := url.Values{
@@ -272,58 +278,65 @@ func fanOutWrite(pool *ServerPool, msgID, clientName, msgText string) (int, erro
 		"msg_id":      {msgID},
 	}
 
-	firstSuccess := make(chan struct{}, 1)
-	var replicatedCount int64
-	var lastErr error
-	var errMu sync.Mutex
-
-	for _, b := range backends {
-		go func(backend *Backend) {
-			resp, err := httpClient.PostForm(backend.URL+"/message", payload)
-			if err != nil {
-				atomic.AddInt64(&backend.TotalErrors, 1)
-				errMu.Lock()
-				lastErr = err
-				errMu.Unlock()
-				return
-			}
-			defer resp.Body.Close()
+	// Try target backend first
+	resp, err := httpClient.PostForm(target.URL+"/message", payload)
+	if err != nil || resp.StatusCode >= 400 {
+		if resp != nil {
 			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		target.SetAlive(false)
+		atomic.AddInt64(&target.TotalErrors, 1)
 
-			if resp.StatusCode >= 400 {
-				atomic.AddInt64(&backend.TotalErrors, 1)
-				errMu.Lock()
-				lastErr = fmt.Errorf("status %d", resp.StatusCode)
-				errMu.Unlock()
-				return
+		// Fallback: try any other backend
+		backends := pool.GetAll()
+		for _, alt := range backends {
+			if alt.URL == target.URL {
+				continue
 			}
-
-			atomic.AddInt64(&backend.TotalServed, 1)
-			count := atomic.AddInt64(&replicatedCount, 1)
-			if count == 1 {
-				select {
-				case firstSuccess <- struct{}{}:
-				default:
-				}
+			resp, err = httpClient.PostForm(alt.URL+"/message", payload)
+			if err == nil && resp.StatusCode < 400 {
+				target = alt
+				break
 			}
-		}(b)
+			if resp != nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}
 	}
 
-	select {
-	case <-firstSuccess:
-		return int(atomic.LoadInt64(&replicatedCount)), nil
-	case <-time.After(8 * time.Second):
-		count := int(atomic.LoadInt64(&replicatedCount))
-		if count > 0 {
-			return count, nil
+	if err != nil || resp == nil || resp.StatusCode >= 400 {
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
 		}
-		errMu.Lock()
-		defer errMu.Unlock()
-		if lastErr != nil {
-			return 0, lastErr
-		}
-		return 0, fmt.Errorf("all writes failed or timed out")
+		return "", fmt.Errorf("backend rejected message")
 	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	atomic.AddInt64(&target.TotalServed, 1)
+
+	// Enqueue asynchronous replication to all other backends
+	for _, b := range pool.GetAll() {
+		if b.URL != target.URL {
+			select {
+			case replicationCh <- ReplicationTask{BackendURL: b.URL, Payload: payload}:
+			default:
+				// If queue full, launch goroutine
+				go func(u string) {
+					r, e := httpClient.PostForm(u+"/message", payload)
+					if e == nil {
+						io.Copy(io.Discard, r.Body)
+						r.Body.Close()
+					}
+				}(b.URL)
+			}
+		}
+	}
+
+	return target.URL, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +351,13 @@ var (
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP Handler
 // ─────────────────────────────────────────────────────────────────────────────
+
+type FeedMessage struct {
+	ID         string `json:"id"`
+	ClientName string `json:"client-name"`
+	Msg        string `json:"msg"`
+	Timestamp  int64  `json:"timestamp"`
+}
 
 func makeHandler(pool *ServerPool) http.Handler {
 	mux := http.NewServeMux()
@@ -370,7 +390,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 			}
 		}
 
-		// 2. If not found, try Form URL-encoded decode
+		// 2. Try Form URL-encoded
 		if clientName == "" || msgText == "" {
 			vals, err := url.ParseQuery(string(bodyBytes))
 			if err == nil && len(vals) > 0 {
@@ -398,14 +418,11 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		// Generate unique ID at the Load Balancer to coordinate all backends
 		msgID := newUUID()
-
-		success, err := fanOutWrite(pool, msgID, clientName, msgText)
-		if success == 0 {
+		backendURL, err := routeMessage(pool, msgID, clientName, msgText)
+		if err != nil {
 			atomic.AddInt64(&totalErrors, 1)
-			log.Printf("[ERROR] All backends failed: %v", err)
-			http.Error(w, `{"error":"all backends unavailable"}`, http.StatusServiceUnavailable)
+			http.Error(w, `{"error":"service unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
 
@@ -416,12 +433,12 @@ func makeHandler(pool *ServerPool) http.Handler {
 			"msg_id":      msgID,
 			"client-name": clientName,
 			"msg":         msgText,
-			"replicated":  success,
+			"backend":     backendURL,
 			"latency_ms":  time.Since(t0).Milliseconds(),
 		})
 	})
 
-	// ── GET /feed ─────────────────────────────────────────────────────────────
+	// ── GET /feed (Merges all backends for 100% completeness) ─────────────────
 	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
 
@@ -430,40 +447,59 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		// Read from the best (lowest load) available backend
-		target := pool.SelectBest()
-		if target == nil {
-			atomic.AddInt64(&totalErrors, 1)
-			http.Error(w, `{"error":"no available backends"}`, http.StatusServiceUnavailable)
-			return
+		backends := pool.GetAll()
+		type feedResult struct {
+			msgs []FeedMessage
+			err  error
 		}
 
-		resp, err := httpClient.Get(target.URL + "/feed")
-		if err != nil || resp.StatusCode != http.StatusOK {
-			// Try other backends as fallback
-			for _, b := range pool.GetAvailable() {
-				if b.URL == target.URL {
-					continue
+		ch := make(chan feedResult, len(backends))
+
+		for _, b := range backends {
+			go func(backendURL string) {
+				resp, err := httpClient.Get(backendURL + "/feed")
+				if err != nil || resp.StatusCode != http.StatusOK {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					ch <- feedResult{nil, fmt.Errorf("failed")}
+					return
 				}
-				resp, err = httpClient.Get(b.URL + "/feed")
-				if err == nil && resp.StatusCode == http.StatusOK {
-					break
+				defer resp.Body.Close()
+				var msgs []FeedMessage
+				json.NewDecoder(resp.Body).Decode(&msgs)
+				ch <- feedResult{msgs, nil}
+			}(b.URL)
+		}
+
+		// Collect and merge messages from all backends
+		seen := make(map[string]bool)
+		var merged []FeedMessage
+
+		for range backends {
+			res := <-ch
+			if res.err == nil {
+				for _, m := range res.msgs {
+					key := m.ID
+					if key == "" {
+						key = fmt.Sprintf("%s_%s_%d", m.ClientName, m.Msg, m.Timestamp)
+					}
+					if !seen[key] {
+						seen[key] = true
+						merged = append(merged, m)
+					}
 				}
 			}
 		}
-		if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
-			atomic.AddInt64(&totalErrors, 1)
-			if resp != nil {
-				resp.Body.Close()
-			}
-			http.Error(w, `{"error":"feed unavailable"}`, http.StatusServiceUnavailable)
-			return
-		}
-		defer resp.Body.Close()
+
+		// Sort merged messages by timestamp ascending
+		sort.Slice(merged, func(i, j int) bool {
+			return merged[i].Timestamp < merged[j].Timestamp
+		})
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(merged)
 	})
 
 	// ── GET /lb-stats ─────────────────────────────────────────────────────────
@@ -518,7 +554,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 func main() {
 	port := flag.Int("port", 3210, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
-		"http://172.17.0.11:4210,http://172.17.0.12:3211,http://172.17.0.13:3212",
+		"http://172.17.0.11:4210,http://172.17.0.12:3000,http://172.17.0.13:3000",
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
 	flag.Parse()
@@ -539,15 +575,17 @@ func main() {
 		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
+	// Start 8 background async replication workers
+	startReplicationWorkers(8)
+
 	// Start background health checker
 	go healthCheck(pool, 2*time.Second)
 
-	// Brief pause so initial health checks populate metrics
 	time.Sleep(1 * time.Second)
 
 	handler := makeHandler(pool)
 
-	// Also listen on port 3000 if not already the main port
+	// Also listen on port 3000 if not the primary port
 	if *port != 3000 {
 		go func() {
 			s3000 := &http.Server{
@@ -559,7 +597,7 @@ func main() {
 			}
 			log.Printf("[DUAL] Also listening on http://0.0.0.0:3000")
 			if err := s3000.ListenAndServe(); err != nil {
-				log.Printf("[DUAL] Port 3000 listener: %v", err)
+				log.Printf("[DUAL] Port 3000 listener stopped: %v", err)
 			}
 		}()
 	}
@@ -573,7 +611,7 @@ func main() {
 	}
 
 	log.Printf("==========================================")
-	log.Printf("  Lab 6 Dynamic Load Balancer")
+	log.Printf("  Lab 6 High-Performance Dynamic Load Balancer")
 	log.Printf("  Listening: http://0.0.0.0:%d and http://0.0.0.0:3000", *port)
 	log.Printf("  Threshold: %.0f  |  Backends: %d", pool.threshold, len(pool.backends))
 	log.Printf("  Routes: POST /message  GET /feed  GET /lb-stats")

@@ -1,24 +1,32 @@
 import sqlite3
 import threading
-import uuid
 
 DB_PATH = "chat.db"
-_lock = threading.Lock()
+_local = threading.local()
+_seen_msg_ids = set()
+_seen_lock = threading.Lock()
+_db_lock = threading.Lock()
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=10000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    return conn
+    """Get or create thread-local SQLite connection with optimized PRAGMAs."""
+    if not hasattr(_local, "conn") or _local.conn is None:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        # Critical performance tuning for high-RPS SQLite
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA cache_size=50000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA busy_timeout=10000")
+        _local.conn = conn
+    return _local.conn
 
 
 def init_db():
-    with get_conn() as conn:
-        # Core messages table with unique msg_id for deduplication
+    global _seen_msg_ids
+    with _db_lock:
+        conn = get_conn()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,10 +55,16 @@ def init_db():
         """)
         conn.commit()
 
+        # Pre-populate in-memory set for O(1) deduplication check
+        rows = conn.execute("SELECT msg_id FROM messages").fetchall()
+        with _seen_lock:
+            _seen_msg_ids = {r["msg_id"] for r in rows}
+
 
 def get_last_hash() -> str:
     """Tail of the hash chain — needed so the next message can link to it."""
-    with get_conn() as conn:
+    with _db_lock:
+        conn = get_conn()
         row = conn.execute(
             "SELECT record_hash FROM messages ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -61,9 +75,15 @@ def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk,
     """
     Save a message to the database.
     Returns True if inserted, False if msg_id already existed (duplicate).
-    Uses INSERT OR IGNORE to prevent duplicate msg_id entries.
+    Uses O(1) in-memory check + INSERT OR IGNORE.
     """
-    with _lock, get_conn() as conn:
+    with _seen_lock:
+        if msg_id in _seen_msg_ids:
+            return False
+        _seen_msg_ids.add(msg_id)
+
+    with _db_lock:
+        conn = get_conn()
         cursor = conn.execute(
             """INSERT OR IGNORE INTO messages
                (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
@@ -74,9 +94,10 @@ def save_message(msg_id, username, plaintext, ciphertext, signature, pubkey_jwk,
         return cursor.rowcount > 0
 
 
-def load_history(limit=10000):
+def load_history(limit=100000):
     """Load all messages ordered by insertion id."""
-    with get_conn() as conn:
+    with _db_lock:
+        conn = get_conn()
         rows = conn.execute(
             "SELECT * FROM messages ORDER BY id ASC LIMIT ?", (limit,)
         ).fetchall()
@@ -88,7 +109,8 @@ def get_messages_for_feed():
     Returns messages in the exact format needed for /feed.
     Returns all messages in insertion order without artificial limit.
     """
-    with get_conn() as conn:
+    with _db_lock:
+        conn = get_conn()
         rows = conn.execute(
             "SELECT msg_id, username, plaintext, timestamp FROM messages ORDER BY id ASC"
         ).fetchall()
@@ -104,23 +126,20 @@ def get_messages_for_feed():
 
 
 def message_exists(msg_id: str) -> bool:
-    """Check if a message with the given msg_id already exists."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM messages WHERE msg_id = ?", (msg_id,)
-        ).fetchone()
-        return row is not None
+    """O(1) in-memory check if a message with the given msg_id already exists."""
+    with _seen_lock:
+        return msg_id in _seen_msg_ids
 
 
 def get_message_count() -> int:
     """Get total number of stored messages."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) as cnt FROM messages").fetchone()
-        return row["cnt"] if row else 0
+    with _seen_lock:
+        return len(_seen_msg_ids)
 
 
 def upsert_user_pubkey(username, pubkey_jwk_str):
-    with _lock, get_conn() as conn:
+    with _db_lock:
+        conn = get_conn()
         conn.execute(
             "INSERT INTO users (username, pubkey_jwk) VALUES (?, ?) "
             "ON CONFLICT(username) DO UPDATE SET pubkey_jwk = excluded.pubkey_jwk",

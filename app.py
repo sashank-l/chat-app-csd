@@ -47,27 +47,35 @@ def track_response_time(elapsed_ms):
             _response_times.pop(0)
 
 
+_cached_cpu = 5.0
+
+def _cpu_sampler():
+    global _cached_cpu
+    prev_idle = 0
+    prev_total = 0
+    while True:
+        try:
+            with open("/proc/stat") as f:
+                line = f.readline()
+            vals = list(map(int, line.split()[1:]))
+            idle = vals[3]
+            total = sum(vals)
+            if prev_total > 0:
+                d_idle = idle - prev_idle
+                d_total = total - prev_total
+                if d_total > 0:
+                    _cached_cpu = round(100.0 * (1.0 - d_idle / d_total), 1)
+            prev_idle, prev_total = idle, total
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+threading.Thread(target=_cpu_sampler, daemon=True).start()
+
+
 def _get_cpu_percent():
-    """Read CPU usage from /proc/stat (Linux) or psutil."""
-    if HAS_PSUTIL:
-        return psutil.cpu_percent(interval=0.1)
-    try:
-        with open("/proc/stat") as f:
-            line = f.readline()
-        vals = list(map(int, line.split()[1:]))
-        idle = vals[3]
-        total = sum(vals)
-        time.sleep(0.1)
-        with open("/proc/stat") as f:
-            line2 = f.readline()
-        vals2 = list(map(int, line2.split()[1:]))
-        idle2 = vals2[3]
-        total2 = sum(vals2)
-        d_idle = idle2 - idle
-        d_total = total2 - total
-        return round(100.0 * (1.0 - d_idle / d_total), 1) if d_total else 0.0
-    except Exception:
-        return 0.0
+    """Non-blocking: returns cached CPU percent immediately."""
+    return _cached_cpu
 
 
 def _get_mem_percent():
