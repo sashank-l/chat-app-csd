@@ -1,9 +1,14 @@
 import argparse
 import json
 import os
-import psutil
 import threading
 import time
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 from flask import Flask, request, jsonify
 from flask_sock import Sock
@@ -42,6 +47,47 @@ def track_response_time(elapsed_ms):
             _response_times.pop(0)
 
 
+def _get_cpu_percent():
+    """Read CPU usage from /proc/stat (Linux) or psutil."""
+    if HAS_PSUTIL:
+        return psutil.cpu_percent(interval=0.1)
+    try:
+        with open("/proc/stat") as f:
+            line = f.readline()
+        vals = list(map(int, line.split()[1:]))
+        idle = vals[3]
+        total = sum(vals)
+        time.sleep(0.1)
+        with open("/proc/stat") as f:
+            line2 = f.readline()
+        vals2 = list(map(int, line2.split()[1:]))
+        idle2 = vals2[3]
+        total2 = sum(vals2)
+        d_idle = idle2 - idle
+        d_total = total2 - total
+        return round(100.0 * (1.0 - d_idle / d_total), 1) if d_total else 0.0
+    except Exception:
+        return 0.0
+
+
+def _get_mem_percent():
+    """Read memory usage from /proc/meminfo or psutil."""
+    if HAS_PSUTIL:
+        return psutil.virtual_memory().percent
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(':')] = int(parts[1])
+        total = info.get("MemTotal", 1)
+        avail = info.get("MemAvailable", total)
+        return round(100.0 * (total - avail) / total, 1)
+    except Exception:
+        return 0.0
+
+
 # ─────────────────────────────────────────────
 # Health & Metrics Routes
 # ─────────────────────────────────────────────
@@ -52,9 +98,8 @@ def health():
     Returns system metrics used by the Load Balancer for dynamic routing decisions.
     Lower values = better backend.
     """
-    cpu_percent = psutil.cpu_percent(interval=0.1)
-    mem = psutil.virtual_memory()
-    mem_percent = mem.percent
+    cpu_percent = _get_cpu_percent()
+    mem_percent = _get_mem_percent()
 
     with _response_times_lock:
         times = list(_response_times)
