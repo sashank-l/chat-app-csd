@@ -66,7 +66,7 @@ func (b *Backend) RecordFailure() {
 	b.ConsecutiveFail++
 	if b.ConsecutiveFail >= 3 {
 		b.Alive = false
-		b.CooldownUntil = time.Now().Add(5 * time.Second)
+		b.CooldownUntil = time.Now().Add(1 * time.Second)
 	}
 }
 
@@ -225,7 +225,7 @@ func (s *ServerPool) AdaptThreshold() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{
-	Timeout: 1500 * time.Millisecond,
+	Timeout: 5000 * time.Millisecond,
 	Transport: &http.Transport{
 		MaxIdleConns:        10000,
 		MaxIdleConnsPerHost: 2000,
