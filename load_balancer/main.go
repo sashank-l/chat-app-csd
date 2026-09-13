@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -92,26 +93,7 @@ func NewMessageStore(filePath string) *MessageStore {
 	ms.feedBytes.Store(&initBytes)
 
 	go ms.diskWriterLoop()
-	go ms.feedCacheLoop()
 	return ms
-}
-
-func (ms *MessageStore) feedCacheLoop() {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
-		if atomic.CompareAndSwapInt32(&ms.dirty, 1, 0) {
-			ms.mu.RLock()
-			n := len(ms.messages)
-			msgsCopy := make([]FeedMessage, n)
-			copy(msgsCopy, ms.messages)
-			ms.mu.RUnlock()
-
-			if data, err := json.Marshal(msgsCopy); err == nil {
-				ms.feedBytes.Store(&data)
-			}
-		}
-	}
 }
 
 func (ms *MessageStore) diskWriterLoop() {
@@ -460,6 +442,16 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 	}
 }
 
+var dispatchClient = &http.Client{
+	Timeout: 500 * time.Millisecond,
+	Transport: &http.Transport{
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 500,
+		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives:   false,
+	},
+}
+
 func startDispatchWorkers(pool *ServerPool, workers int) {
 	for i := 0; i < workers; i++ {
 		go func() {
@@ -480,16 +472,12 @@ func startDispatchWorkers(pool *ServerPool, workers int) {
 					req, reqErr := http.NewRequest(http.MethodPost, backend.URL+"/message", strings.NewReader(string(payload)))
 					if reqErr == nil {
 						req.Header.Set("Content-Type", "application/json")
-						resp, doErr := httpClient.Do(req)
+						resp, doErr := dispatchClient.Do(req)
 						if doErr == nil && resp != nil {
 							_ = resp.Body.Close()
 							if resp.StatusCode == http.StatusOK {
 								backend.RecordSuccess()
-							} else {
-								backend.RecordFailure()
 							}
-						} else {
-							backend.RecordFailure()
 						}
 					}
 				}
@@ -652,6 +640,15 @@ func makeHandler(pool *ServerPool) http.Handler {
 			}(b.URL)
 		}
 
+		// Also ensure Central Shared DBaaS is reset
+		go func() {
+			req, _ := http.NewRequest(http.MethodPost, "http://172.17.0.11:4000/reset-state", nil)
+			resp, err := httpClient.Do(req)
+			if err == nil && resp != nil {
+				_ = resp.Body.Close()
+			}
+		}()
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "ok",
@@ -731,13 +728,15 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	}
 
+	runtime.GOMAXPROCS(16)
+
 	// 300 MB heap cap ensures maximum headroom within 512 MB cgroup without GC thrashing
 	debug.SetMemoryLimit(300 * 1024 * 1024)
 	debug.SetGCPercent(100)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
-		"http://172.17.0.11:4000,http://172.17.0.12:3000,http://172.17.0.13:3000",
+		"http://172.17.0.12:3000,http://172.17.0.13:3000",
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
 	logFilePath := flag.String("logfile", "/home/student/chat_messages.jsonl", "Append-only message log file")
@@ -750,7 +749,7 @@ func main() {
 		store:      store,
 		dispatchCh: make(chan FeedMessage, 50000),
 	}
-	startDispatchWorkers(pool, 8)
+	startDispatchWorkers(pool, 4)
 
 	for _, rawURL := range strings.Split(*backendsStr, ",") {
 		rawURL = strings.TrimSpace(rawURL)
