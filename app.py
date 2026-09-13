@@ -292,6 +292,11 @@ def get_feed():
 def reset_state():
     """Reset messages database and memory cache for a clean benchmark run."""
     db.reset_db()
+    global _last_hash_val
+    with _hash_chain_lock:
+        _last_hash_val = "0" * 64
+    with _keypair_lock:
+        _keypair_cache.clear()
     return jsonify({"status": "ok", "message": "database reset complete"}), 200
 
 

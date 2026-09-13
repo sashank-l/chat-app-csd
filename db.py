@@ -360,3 +360,32 @@ def load_shared_messages(limit=100000):
             (limit,)
         )
         return [dict(r) for r in cur.fetchall()]
+
+
+def reset_db():
+    """Clear all messages from RAM caches, write queue, and SQLite database."""
+    global _seen_msg_ids, _memory_feed
+    
+    # Drain write queue
+    while not _write_queue.empty():
+        try:
+            _write_queue.get_nowait()
+            _write_queue.task_done()
+        except (queue.Empty, ValueError):
+            break
+
+    with _seen_lock:
+        _seen_msg_ids.clear()
+
+    with _feed_lock:
+        _memory_feed.clear()
+
+    with _db_lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='messages'")
+        conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -56,8 +55,8 @@ type MessageStore struct {
 
 func NewMessageStore(filePath string) *MessageStore {
 	ms := &MessageStore{
-		messages: make([]FeedMessage, 0, 50000),
-		seen:     make(map[string]bool, 50000),
+		messages: make([]FeedMessage, 0, 100000),
+		seen:     make(map[string]bool, 100000),
 		filePath: filePath,
 		diskCh:   make(chan FeedMessage, 100000),
 	}
@@ -216,8 +215,8 @@ func (ms *MessageStore) Count() int {
 
 func (ms *MessageStore) Reset() {
 	ms.mu.Lock()
-	ms.messages = make([]FeedMessage, 0, 50000)
-	ms.seen = make(map[string]bool, 50000)
+	ms.messages = make([]FeedMessage, 0, 100000)
+	ms.seen = make(map[string]bool, 100000)
 	empty := []byte("[]")
 	ms.feedBytes.Store(&empty)
 	atomic.StoreInt32(&ms.dirty, 0)
@@ -596,9 +595,11 @@ func makeHandler(pool *ServerPool) http.Handler {
 		default:
 		}
 
+		respData := []byte(`{"status":"ok","msg_id":"` + msgID + `","client-name":"` + clientName + `","timestamp":` + strconv.FormatInt(nowMs, 10) + `}`)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(respData)))
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status":"ok","msg_id":"%s","client-name":"%s","timestamp":%d}`, msgID, clientName, nowMs)
+		_, _ = w.Write(respData)
 	})
 
 	// ── GET /feed ────────────────────────────────────────────────────────────
@@ -705,15 +706,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 // createCustomListener binds with bounded kernel socket buffers to prevent socket memory exhaustion
 func createCustomListener(addr string) (net.Listener, error) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024)
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024)
-			})
-		},
-	}
-	return lc.Listen(context.Background(), "tcp", addr)
+	return net.Listen("tcp", addr)
 }
 
 func main() {
