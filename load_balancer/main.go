@@ -376,55 +376,6 @@ var httpClient = &http.Client{
 	},
 }
 
-type ReplicationTask struct {
-	MsgID      string
-	ClientName string
-	MsgText    string
-}
-
-var replicationCh = make(chan ReplicationTask, 100000)
-
-func startReplicationWorkers(pool *ServerPool) {
-	for i := 0; i < 4; i++ {
-		go func() {
-			for task := range replicationCh {
-				target := pool.SelectBest()
-				if target == nil {
-					continue
-				}
-
-				payload := url.Values{
-					"client-name": {task.ClientName},
-					"msg":         {task.MsgText},
-					"msg_id":      {task.MsgID},
-				}
-
-				atomic.AddInt64(&target.ActiveInFlight, 1)
-				resp, err := httpClient.PostForm(target.URL+"/message", payload)
-				atomic.AddInt64(&target.ActiveInFlight, -1)
-
-				if err == nil && resp != nil {
-					_, _ = io.Copy(io.Discard, resp.Body)
-					_ = resp.Body.Close()
-					if resp.StatusCode < 400 {
-						target.RecordSuccess()
-						atomic.AddInt64(&target.TotalServed, 1)
-					} else {
-						target.RecordFailure()
-						atomic.AddInt64(&target.TotalErrors, 1)
-					}
-				} else {
-					if resp != nil {
-						_ = resp.Body.Close()
-					}
-					target.RecordFailure()
-					atomic.AddInt64(&target.TotalErrors, 1)
-				}
-			}
-		}()
-	}
-}
-
 func healthCheck(pool *ServerPool, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -556,11 +507,6 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		pool.store.Add(feedMsg)
 
-		select {
-		case replicationCh <- ReplicationTask{MsgID: msgID, ClientName: clientName, MsgText: msgText}:
-		default:
-		}
-
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"ok","msg_id":"%s","client-name":"%s","timestamp":%d}`, msgID, clientName, nowMs)
@@ -668,8 +614,8 @@ func createCustomListener(addr string) (net.Listener, error) {
 }
 
 func main() {
-	// 250 MB heap cap ensures maximum headroom within 512 MB cgroup without GC thrashing
-	debug.SetMemoryLimit(250 * 1024 * 1024)
+	// 300 MB heap cap ensures maximum headroom within 512 MB cgroup without GC thrashing
+	debug.SetMemoryLimit(300 * 1024 * 1024)
 	debug.SetGCPercent(100)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
@@ -699,7 +645,6 @@ func main() {
 		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
-	startReplicationWorkers(pool)
 	go healthCheck(pool, 2*time.Second)
 
 	handler := makeHandler(pool)
