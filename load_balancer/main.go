@@ -16,6 +16,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,11 +44,13 @@ type FeedMessage struct {
 }
 
 type MessageStore struct {
-	mu       sync.RWMutex
-	messages []FeedMessage
-	seen     map[string]bool
-	filePath string
-	diskCh   chan FeedMessage
+	mu        sync.RWMutex
+	messages  []FeedMessage
+	seen      map[string]bool
+	filePath  string
+	diskCh    chan FeedMessage
+	feedBytes atomic.Pointer[[]byte]
+	dirty     int32
 }
 
 func NewMessageStore(filePath string) *MessageStore {
@@ -80,8 +83,35 @@ func NewMessageStore(filePath string) *MessageStore {
 		log.Printf("[STORE] Recovered %d messages from %s", len(ms.messages), filePath)
 	}
 
+	initBytes := []byte("[]")
+	if len(ms.messages) > 0 {
+		if data, err := json.Marshal(ms.messages); err == nil {
+			initBytes = data
+		}
+	}
+	ms.feedBytes.Store(&initBytes)
+
 	go ms.diskWriterLoop()
+	go ms.feedCacheLoop()
 	return ms
+}
+
+func (ms *MessageStore) feedCacheLoop() {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if atomic.CompareAndSwapInt32(&ms.dirty, 1, 0) {
+			ms.mu.RLock()
+			n := len(ms.messages)
+			msgsCopy := make([]FeedMessage, n)
+			copy(msgsCopy, ms.messages)
+			ms.mu.RUnlock()
+
+			if data, err := json.Marshal(msgsCopy); err == nil {
+				ms.feedBytes.Store(&data)
+			}
+		}
+	}
 }
 
 func (ms *MessageStore) diskWriterLoop() {
@@ -156,6 +186,7 @@ func (ms *MessageStore) Add(msg FeedMessage) bool {
 	}
 	ms.seen[key] = true
 	ms.messages = append(ms.messages, msg)
+	atomic.StoreInt32(&ms.dirty, 1)
 	ms.mu.Unlock()
 
 	select {
@@ -164,6 +195,14 @@ func (ms *MessageStore) Add(msg FeedMessage) bool {
 	}
 
 	return true
+}
+
+func (ms *MessageStore) GetFeedBytes() []byte {
+	ptr := ms.feedBytes.Load()
+	if ptr != nil {
+		return *ptr
+	}
+	return []byte("[]")
 }
 
 func (ms *MessageStore) GetAll() []FeedMessage {
@@ -184,6 +223,9 @@ func (ms *MessageStore) Reset() {
 	ms.mu.Lock()
 	ms.messages = make([]FeedMessage, 0, 50000)
 	ms.seen = make(map[string]bool, 50000)
+	empty := []byte("[]")
+	ms.feedBytes.Store(&empty)
+	atomic.StoreInt32(&ms.dirty, 0)
 	ms.mu.Unlock()
 
 	for len(ms.diskCh) > 0 {
@@ -521,15 +563,12 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		allMsgs := pool.store.GetAll()
-
-		sort.Slice(allMsgs, func(i, j int) bool {
-			return allMsgs[i].Timestamp < allMsgs[j].Timestamp
-		})
+		data := pool.store.GetFeedBytes()
 
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(allMsgs)
+		_, _ = w.Write(data)
 	})
 
 	// ── POST /reset-state ────────────────────────────────────────────────────
