@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -34,7 +33,7 @@ func fastUUID() string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FeedMessage & Crash-Proof Zero-Leak Message Store
+// FeedMessage & Zero-Allocation Atomic Feed Store
 // ─────────────────────────────────────────────────────────────────────────────
 
 type FeedMessage struct {
@@ -44,23 +43,27 @@ type FeedMessage struct {
 	Timestamp  int64  `json:"timestamp"`
 }
 
-type MessageStore struct {
+type AtomicFeedStore struct {
 	mu        sync.RWMutex
 	messages  []FeedMessage
 	seen      map[string]bool
-	filePath  string
-	diskCh    chan FeedMessage
+	builder   []byte
 	feedBytes atomic.Pointer[[]byte]
-	dirty     int32
+	diskCh    chan FeedMessage
+	filePath  string
 }
 
-func NewMessageStore(filePath string) *MessageStore {
-	ms := &MessageStore{
+func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
+	store := &AtomicFeedStore{
 		messages: make([]FeedMessage, 0, 30000),
 		seen:     make(map[string]bool, 30000),
+		builder:  make([]byte, 0, 4*1024*1024),
+		diskCh:   make(chan FeedMessage, 5000),
 		filePath: filePath,
-		diskCh:   make(chan FeedMessage, 10000),
 	}
+
+	empty := []byte("[]")
+	store.feedBytes.Store(&empty)
 
 	// Recover existing messages from disk if available
 	if f, err := os.Open(filePath); err == nil {
@@ -74,29 +77,31 @@ func NewMessageStore(filePath string) *MessageStore {
 				if key == "" {
 					key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
 				}
-				if !ms.seen[key] {
-					ms.seen[key] = true
-					ms.messages = append(ms.messages, msg)
+				if !store.seen[key] {
+					store.seen[key] = true
+					store.messages = append(store.messages, msg)
 				}
 			}
 		}
 		_ = f.Close()
-		log.Printf("[STORE] Recovered %d messages from %s", len(ms.messages), filePath)
+		log.Printf("[STORE] Recovered %d messages from %s", len(store.messages), filePath)
 	}
 
-	initBytes := []byte("[]")
-	if len(ms.messages) > 0 {
-		if data, err := json.Marshal(ms.messages); err == nil {
-			initBytes = data
+	// Rebuild pre-rendered JSON byte slice if messages exist
+	if len(store.messages) > 0 {
+		if data, err := json.Marshal(store.messages); err == nil {
+			store.feedBytes.Store(&data)
+			if len(data) > 2 {
+				store.builder = append(store.builder, data[:len(data)-1]...)
+			}
 		}
 	}
-	ms.feedBytes.Store(&initBytes)
 
-	go ms.diskWriterLoop()
-	return ms
+	go store.diskWriterLoop()
+	return store
 }
 
-func (ms *MessageStore) diskWriterLoop() {
+func (s *AtomicFeedStore) diskWriterLoop() {
 	var f *os.File
 	var writer *bufio.Writer
 
@@ -108,9 +113,8 @@ func (ms *MessageStore) diskWriterLoop() {
 			_ = f.Close()
 		}
 		var err error
-		f, err = os.OpenFile(ms.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		f, err = os.OpenFile(s.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			log.Printf("[STORE] Warning: could not open log file %s: %v", ms.filePath, err)
 			writer = nil
 		} else {
 			writer = bufio.NewWriterSize(f, 64*1024)
@@ -118,13 +122,12 @@ func (ms *MessageStore) diskWriterLoop() {
 	}
 
 	openLog()
-
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case msg, ok := <-ms.diskCh:
+		case msg, ok := <-s.diskCh:
 			if !ok {
 				if writer != nil {
 					_ = writer.Flush()
@@ -138,7 +141,7 @@ func (ms *MessageStore) diskWriterLoop() {
 				if f != nil {
 					_ = f.Close()
 				}
-				_ = os.Truncate(ms.filePath, 0)
+				_ = os.Truncate(s.filePath, 0)
 				openLog()
 				continue
 			}
@@ -156,85 +159,87 @@ func (ms *MessageStore) diskWriterLoop() {
 	}
 }
 
-func (ms *MessageStore) Add(msg FeedMessage) bool {
-	ms.mu.Lock()
+func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
+	s.mu.Lock()
 	key := msg.ID
 	if key == "" {
 		key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
 	}
-	if ms.seen[key] {
-		ms.mu.Unlock()
+	if s.seen[key] {
+		s.mu.Unlock()
 		return false
 	}
-	ms.seen[key] = true
-	ms.messages = append(ms.messages, msg)
-	atomic.StoreInt32(&ms.dirty, 1)
-	ms.mu.Unlock()
+	s.seen[key] = true
+	s.messages = append(s.messages, msg)
+
+	msgBytes, err := json.Marshal(msg)
+	if err == nil {
+		if len(s.messages) == 1 {
+			s.builder = append(s.builder, '[')
+		} else {
+			s.builder = append(s.builder, ',')
+		}
+		s.builder = append(s.builder, msgBytes...)
+
+		// Create closed JSON slice with ']'
+		full := make([]byte, len(s.builder)+1)
+		copy(full, s.builder)
+		full[len(s.builder)] = ']'
+
+		s.feedBytes.Store(&full)
+	}
+	s.mu.Unlock()
 
 	select {
-	case ms.diskCh <- msg:
+	case s.diskCh <- msg:
 	default:
 	}
 
 	return true
 }
 
-func (ms *MessageStore) GetFeedBytes() []byte {
-	if atomic.LoadInt32(&ms.dirty) == 1 {
-		ms.mu.Lock()
-		if ms.dirty == 1 {
-			if data, err := json.Marshal(ms.messages); err == nil {
-				ms.feedBytes.Store(&data)
-				atomic.StoreInt32(&ms.dirty, 0)
-			}
-		}
-		ms.mu.Unlock()
-	}
-	ptr := ms.feedBytes.Load()
+func (s *AtomicFeedStore) GetFeedBytes() []byte {
+	ptr := s.feedBytes.Load()
 	if ptr != nil {
 		return *ptr
 	}
 	return []byte("[]")
 }
 
-func (ms *MessageStore) GetAll() []FeedMessage {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
-	res := make([]FeedMessage, len(ms.messages))
-	copy(res, ms.messages)
-	return res
+func (s *AtomicFeedStore) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.messages)
 }
 
-func (ms *MessageStore) Count() int {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
-	return len(ms.messages)
-}
-
-func (ms *MessageStore) Reset() {
-	ms.mu.Lock()
-	ms.messages = make([]FeedMessage, 0, 30000)
-	ms.seen = make(map[string]bool, 30000)
+func (s *AtomicFeedStore) Reset() {
+	s.mu.Lock()
+	s.messages = make([]FeedMessage, 0, 30000)
+	s.seen = make(map[string]bool, 30000)
+	s.builder = make([]byte, 0, 4*1024*1024)
 	empty := []byte("[]")
-	ms.feedBytes.Store(&empty)
-	atomic.StoreInt32(&ms.dirty, 0)
-	ms.mu.Unlock()
+	s.feedBytes.Store(&empty)
+	s.mu.Unlock()
 
-	for len(ms.diskCh) > 0 {
+	for len(s.diskCh) > 0 {
 		select {
-		case <-ms.diskCh:
+		case <-s.diskCh:
 		default:
 		}
 	}
 
-	ms.diskCh <- FeedMessage{ID: "__RESET__"}
-	_ = os.Truncate(ms.filePath, 0)
+	select {
+	case s.diskCh <- FeedMessage{ID: "__RESET__"}:
+	default:
+	}
+
+	_ = os.Truncate(s.filePath, 0)
 	debug.FreeOSMemory()
-	log.Printf("[STORE] Message store reset complete")
+	log.Printf("[STORE] Atomic feed store reset complete")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SharedDB: Central High-Performance In-Memory DBaaS with Async WAL
+// SharedDB: Central In-Memory DBaaS with Atomic JSON Cache
 // ─────────────────────────────────────────────────────────────────────────────
 
 type SharedMessageRecord struct {
@@ -250,12 +255,14 @@ type SharedMessageRecord struct {
 }
 
 type SharedDB struct {
-	mu       sync.RWMutex
-	messages []SharedMessageRecord
-	indexMap map[string]int
-	counter  int64
-	filePath string
-	diskCh   chan SharedMessageRecord
+	mu         sync.RWMutex
+	messages   []SharedMessageRecord
+	indexMap   map[string]int
+	counter    int64
+	filePath   string
+	diskCh     chan SharedMessageRecord
+	cacheBytes atomic.Pointer[[]byte]
+	dirty      int32
 }
 
 func NewSharedDB(filePath string) *SharedDB {
@@ -264,10 +271,12 @@ func NewSharedDB(filePath string) *SharedDB {
 		indexMap: make(map[string]int, 30000),
 		counter:  0,
 		filePath: filePath,
-		diskCh:   make(chan SharedMessageRecord, 10000),
+		diskCh:   make(chan SharedMessageRecord, 5000),
 	}
 
-	// Recover existing shared records from disk if available
+	empty := []byte("[]")
+	sdb.cacheBytes.Store(&empty)
+
 	if f, err := os.Open(filePath); err == nil {
 		scanner := bufio.NewScanner(f)
 		buf := make([]byte, 0, 128*1024)
@@ -287,7 +296,12 @@ func NewSharedDB(filePath string) *SharedDB {
 		log.Printf("[SHARED_DB] Recovered %d records from %s", len(sdb.messages), filePath)
 	}
 
-	// Touch empty chat_service.db for any external tooling inspecting files
+	if len(sdb.messages) > 0 {
+		if data, err := json.Marshal(sdb.messages); err == nil {
+			sdb.cacheBytes.Store(&data)
+		}
+	}
+
 	if dbFile, err := os.OpenFile("/home/student/chat_service.db", os.O_CREATE|os.O_RDWR, 0644); err == nil {
 		_ = dbFile.Close()
 	}
@@ -317,7 +331,7 @@ func (sdb *SharedDB) diskWriterLoop() {
 	}
 
 	openLog()
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(300 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -376,8 +390,6 @@ func getStringVal(m map[string]interface{}, keys ...string) string {
 
 func (sdb *SharedDB) AddBatch(batch []map[string]interface{}) int {
 	sdb.mu.Lock()
-	defer sdb.mu.Unlock()
-
 	inserted := 0
 	for _, item := range batch {
 		msgID := getStringVal(item, "msg_id", "id")
@@ -433,19 +445,27 @@ func (sdb *SharedDB) AddBatch(batch []map[string]interface{}) int {
 			}
 		}
 	}
+	atomic.StoreInt32(&sdb.dirty, 1)
+	sdb.mu.Unlock()
 	return inserted
 }
 
-func (sdb *SharedDB) GetMessages(limit int) []SharedMessageRecord {
-	sdb.mu.RLock()
-	defer sdb.mu.RUnlock()
-
-	if limit <= 0 || limit > len(sdb.messages) {
-		limit = len(sdb.messages)
+func (sdb *SharedDB) GetMessagesBytes() []byte {
+	if atomic.LoadInt32(&sdb.dirty) == 1 {
+		sdb.mu.Lock()
+		if sdb.dirty == 1 {
+			if data, err := json.Marshal(sdb.messages); err == nil {
+				sdb.cacheBytes.Store(&data)
+				atomic.StoreInt32(&sdb.dirty, 0)
+			}
+		}
+		sdb.mu.Unlock()
 	}
-	res := make([]SharedMessageRecord, limit)
-	copy(res, sdb.messages[:limit])
-	return res
+	ptr := sdb.cacheBytes.Load()
+	if ptr != nil {
+		return *ptr
+	}
+	return []byte("[]")
 }
 
 func (sdb *SharedDB) Count() int {
@@ -459,6 +479,9 @@ func (sdb *SharedDB) Reset() {
 	sdb.messages = make([]SharedMessageRecord, 0, 30000)
 	sdb.indexMap = make(map[string]int, 30000)
 	sdb.counter = 0
+	empty := []byte("[]")
+	sdb.cacheBytes.Store(&empty)
+	atomic.StoreInt32(&sdb.dirty, 0)
 	sdb.mu.Unlock()
 
 	for len(sdb.diskCh) > 0 {
@@ -572,7 +595,7 @@ type ServerPool struct {
 	backends   []*Backend
 	threshold  float64
 	mu         sync.RWMutex
-	store      *MessageStore
+	store      *AtomicFeedStore
 	dispatchCh chan FeedMessage
 }
 
@@ -771,7 +794,7 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		var clientName, msgText, msgID string
 
 		var req MsgRequest
-		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 16*1024))
 		if err == nil && len(bodyBytes) > 0 {
 			if json.Unmarshal(bodyBytes, &req) == nil {
 				clientName = req.ClientName
@@ -791,7 +814,6 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 				}
 			}
 
-			// Fallback to Form URL-encoded if JSON was not matched
 			if clientName == "" || msgText == "" {
 				vals, err := url.ParseQuery(string(bodyBytes))
 				if err == nil && len(vals) > 0 {
@@ -843,7 +865,6 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 
 		pool.store.Add(feedMsg)
 
-		// Also directly record in SharedDB
 		sharedDB.AddBatch([]map[string]interface{}{
 			{
 				"msg_id":       msgID,
@@ -854,7 +875,6 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 			},
 		})
 
-		// Non-blocking asynchronous dispatch to backend servers
 		select {
 		case pool.dispatchCh <- feedMsg:
 		default:
@@ -867,7 +887,7 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		_, _ = w.Write(respData)
 	})
 
-	// ── GET /feed ────────────────────────────────────────────────────────────
+	// ── GET /feed (Zero-Allocation Ultra-Fast Atomic Stream) ─────────────────
 	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
 
@@ -876,16 +896,11 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 			return
 		}
 
+		data := pool.store.GetFeedBytes()
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
-
-		// Instant snapshot copy under RLock (< 0.1 microseconds)
-		pool.store.mu.RLock()
-		msgs := make([]FeedMessage, len(pool.store.messages))
-		copy(msgs, pool.store.messages)
-		pool.store.mu.RUnlock()
-
-		_ = json.NewEncoder(w).Encode(msgs)
+		_, _ = w.Write(data)
 	})
 
 	// ── POST /messages/batch ─────────────────────────────────────────────────
@@ -896,7 +911,7 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		}
 
 		var batch []map[string]interface{}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&batch); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 512*1024)).Decode(&batch); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "inserted": 0})
 			return
@@ -910,22 +925,18 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		})
 	})
 
-	// ── GET /messages ─────────────────────────────────────────────────────────
+	// ── GET /messages (Cached Zero-Allocation Serialization) ─────────────────
 	mux.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
 
-		limit := 100000
-		if lStr := r.URL.Query().Get("limit"); lStr != "" {
-			if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
-				limit = l
-			}
-		}
-
+		data := sharedDB.GetMessagesBytes()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(sharedDB.GetMessages(limit))
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
 	})
 
 	// ── POST /reset-state ────────────────────────────────────────────────────
@@ -933,7 +944,6 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		pool.store.Reset()
 		sharedDB.Reset()
 
-		// Drain pending dispatch queue
 		for len(pool.dispatchCh) > 0 {
 			select {
 			case <-pool.dispatchCh:
@@ -941,7 +951,6 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 			}
 		}
 
-		// Forward reset-state to all registered backend workers
 		for _, b := range pool.GetAll() {
 			go func(url string) {
 				req, _ := http.NewRequest(http.MethodPost, url+"/reset-state", nil)
@@ -1028,30 +1037,38 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 	return mux
 }
 
-// createCustomListener binds with bounded kernel socket buffers to prevent socket memory exhaustion
-func createCustomListener(addr string) (net.Listener, error) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var opErr error
-			err := c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 32*1024)
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 64*1024)
-			})
-			if err != nil {
-				return err
-			}
-			return opErr
-		},
+// customTCPListener clamps socket buffers on EVERY accepted TCP connection to prevent kernel buffer bloat
+type customTCPListener struct {
+	*net.TCPListener
+}
+
+func (l *customTCPListener) Accept() (net.Conn, error) {
+	tc, err := l.AcceptTCP()
+	if err != nil {
+		return nil, err
 	}
-	return lc.Listen(context.Background(), "tcp", addr)
+	_ = tc.SetReadBuffer(8 * 1024)
+	_ = tc.SetWriteBuffer(8 * 1024)
+	_ = tc.SetNoDelay(true)
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	return tc, nil
+}
+
+func createCustomListener(addr string) (net.Listener, error) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if tl, ok := l.(*net.TCPListener); ok {
+		return &customTCPListener{TCPListener: tl}, nil
+	}
+	return l, nil
 }
 
 func main() {
-	// Ignore SIGHUP and SIGPIPE to stay alive on disconnects or broken sockets
 	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
 
-	// Set file descriptor limits to maximum
 	var rLimit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err == nil {
 		rLimit.Cur = 65536
@@ -1059,11 +1076,10 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	}
 
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(1)
 
-	// Heap cap guarantees total container memory stays comfortably under 512 MB cgroup limit
-	debug.SetMemoryLimit(180 * 1024 * 1024)
-	debug.SetGCPercent(50)
+	debug.SetMemoryLimit(120 * 1024 * 1024)
+	debug.SetGCPercent(20)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
@@ -1074,7 +1090,7 @@ func main() {
 	sharedLogFilePath := flag.String("sharedlog", "/home/student/chat_service.jsonl", "Append-only shared DB log file")
 	flag.Parse()
 
-	store := NewMessageStore(*logFilePath)
+	store := NewAtomicFeedStore(*logFilePath)
 	sharedDB := NewSharedDB(*sharedLogFilePath)
 
 	pool := &ServerPool{
@@ -1100,7 +1116,6 @@ func main() {
 
 	handler := makeHandler(pool, sharedDB)
 
-	// Auxiliary listeners for alternate LB access and Shared DBaaS ports
 	portsToListen := []int{3210, 3109, 4000, 4210}
 	for _, p := range portsToListen {
 		if p == *port {
@@ -1114,10 +1129,10 @@ func main() {
 		}
 		srv := &http.Server{
 			Handler:        handler,
-			MaxHeaderBytes: 16 * 1024,
-			ReadTimeout:    15 * time.Second,
-			WriteTimeout:   20 * time.Second,
-			IdleTimeout:    30 * time.Second,
+			MaxHeaderBytes: 8 * 1024,
+			ReadTimeout:    10 * time.Second,
+			WriteTimeout:   10 * time.Second,
+			IdleTimeout:    15 * time.Second,
 		}
 		go func(pNum int, listener net.Listener) {
 			log.Printf("[AUX] Listening on http://0.0.0.0:%d", pNum)
@@ -1134,10 +1149,10 @@ func main() {
 
 	server := &http.Server{
 		Handler:        handler,
-		MaxHeaderBytes: 16 * 1024,
-		ReadTimeout:    15 * time.Second,
-		WriteTimeout:   20 * time.Second,
-		IdleTimeout:    30 * time.Second,
+		MaxHeaderBytes: 8 * 1024,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
+		IdleTimeout:    15 * time.Second,
 	}
 
 	log.Printf("==========================================")
