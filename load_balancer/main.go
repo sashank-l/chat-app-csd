@@ -664,6 +664,26 @@ func makeHandler(pool *ServerPool) http.Handler {
 		})
 	})
 
+	// ── GET /debug/mem ───────────────────────────────────────────────────────
+	mux.HandleFunc("/debug/mem", func(w http.ResponseWriter, r *http.Request) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"AllocMB":        m.Alloc / 1024 / 1024,
+			"TotalAllocMB":   m.TotalAlloc / 1024 / 1024,
+			"SysMB":          m.Sys / 1024 / 1024,
+			"HeapAllocMB":    m.HeapAlloc / 1024 / 1024,
+			"HeapSysMB":      m.HeapSys / 1024 / 1024,
+			"HeapIdleMB":     m.HeapIdle / 1024 / 1024,
+			"HeapInuseMB":    m.HeapInuse / 1024 / 1024,
+			"HeapReleasedMB": m.HeapReleased / 1024 / 1024,
+			"StackInuseMB":   m.StackInuse / 1024 / 1024,
+			"StackSysMB":     m.StackSys / 1024 / 1024,
+			"NumGC":          m.NumGC,
+		})
+	})
+
 	// ── GET /lb-stats ─────────────────────────────────────────────────────────
 	mux.HandleFunc("/lb-stats", func(w http.ResponseWriter, r *http.Request) {
 		pool.mu.RLock()
@@ -728,11 +748,11 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	}
 
-	runtime.GOMAXPROCS(16)
+	runtime.GOMAXPROCS(2)
 
-	// 300 MB heap cap ensures maximum headroom within 512 MB cgroup without GC thrashing
-	debug.SetMemoryLimit(300 * 1024 * 1024)
-	debug.SetGCPercent(100)
+	// Hard 120 MB heap cap guarantees memory stays well below the 512 MB cgroup limit
+	debug.SetMemoryLimit(120 * 1024 * 1024)
+	debug.SetGCPercent(50)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
