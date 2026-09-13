@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	mrand "math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -19,7 +21,6 @@ import (
 	"time"
 )
 
-// newUUID generates a random UUID v4 using crypto/rand (no external dependency).
 func newUUID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
@@ -34,9 +35,116 @@ func newUUID() string {
 	)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Backend struct: tracks health and dynamic metrics
-// ─────────────────────────────────────────────────────────────────────────────
+type FeedMessage struct {
+	ID         string `json:"id"`
+	ClientName string `json:"client-name"`
+	Msg        string `json:"msg"`
+	Timestamp  int64  `json:"timestamp"`
+}
+
+type MessageStore struct {
+	mu       sync.RWMutex
+	messages []FeedMessage
+	seen     map[string]bool
+	fileMu   sync.Mutex
+	logFile  *os.File
+	filePath string
+}
+
+func NewMessageStore(filePath string) *MessageStore {
+	ms := &MessageStore{
+		messages: make([]FeedMessage, 0, 100000),
+		seen:     make(map[string]bool, 100000),
+		filePath: filePath,
+	}
+
+	if f, err := os.Open(filePath); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			var msg FeedMessage
+			if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
+				key := msg.ID
+				if key == "" {
+					key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
+				}
+				if !ms.seen[key] {
+					ms.seen[key] = true
+					ms.messages = append(ms.messages, msg)
+				}
+			}
+		}
+		f.Close()
+		log.Printf("[STORE] Recovered %d messages from %s", len(ms.messages), filePath)
+	}
+
+	logF, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("[STORE] Warning: could not open log file %s: %v", filePath, err)
+	} else {
+		ms.logFile = logF
+	}
+
+	return ms
+}
+
+func (ms *MessageStore) Add(msg FeedMessage) bool {
+	ms.mu.Lock()
+	key := msg.ID
+	if key == "" {
+		key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
+	}
+	if ms.seen[key] {
+		ms.mu.Unlock()
+		return false
+	}
+	ms.seen[key] = true
+	ms.messages = append(ms.messages, msg)
+	ms.mu.Unlock()
+
+	go func(m FeedMessage) {
+		ms.fileMu.Lock()
+		defer ms.fileMu.Unlock()
+		if ms.logFile != nil {
+			if data, err := json.Marshal(m); err == nil {
+				ms.logFile.Write(append(data, '\n'))
+			}
+		}
+	}(msg)
+
+	return true
+}
+
+func (ms *MessageStore) GetAll() []FeedMessage {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	res := make([]FeedMessage, len(ms.messages))
+	copy(res, ms.messages)
+	return res
+}
+
+func (ms *MessageStore) Count() int {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return len(ms.messages)
+}
+
+func (ms *MessageStore) Reset() {
+	ms.mu.Lock()
+	ms.messages = make([]FeedMessage, 0, 100000)
+	ms.seen = make(map[string]bool, 100000)
+	ms.mu.Unlock()
+
+	ms.fileMu.Lock()
+	if ms.logFile != nil {
+		ms.logFile.Close()
+	}
+	_ = os.Truncate(ms.filePath, 0)
+	if f, err := os.OpenFile(ms.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		ms.logFile = f
+	}
+	ms.fileMu.Unlock()
+	log.Printf("[STORE] Message store reset complete")
+}
 
 type HealthData struct {
 	Status            string  `json:"status"`
@@ -64,9 +172,9 @@ func (b *Backend) RecordFailure() {
 	b.mux.Lock()
 	defer b.mux.Unlock()
 	b.ConsecutiveFail++
-	if b.ConsecutiveFail >= 3 {
+	if b.ConsecutiveFail >= 5 {
 		b.Alive = false
-		b.CooldownUntil = time.Now().Add(1 * time.Second)
+		b.CooldownUntil = time.Now().Add(2 * time.Second)
 	}
 }
 
@@ -83,9 +191,9 @@ func (b *Backend) SetAlive(alive bool) {
 	defer b.mux.Unlock()
 	if !alive {
 		b.ConsecutiveFail++
-		if b.ConsecutiveFail >= 2 {
+		if b.ConsecutiveFail >= 3 {
 			b.Alive = false
-			b.CooldownUntil = time.Now().Add(3 * time.Second)
+			b.CooldownUntil = time.Now().Add(2 * time.Second)
 		}
 	} else {
 		b.ConsecutiveFail = 0
@@ -113,17 +221,7 @@ func (b *Backend) GetEffectiveScore() float64 {
 		return math.MaxFloat64
 	}
 	inflight := atomic.LoadInt64(&b.ActiveInFlight)
-	// Base load score + 2.0 penalty per concurrent in-flight request
-	return b.Health.LoadScore + float64(inflight)*2.0
-}
-
-func (b *Backend) GetLoadScore() float64 {
-	b.mux.RLock()
-	defer b.mux.RUnlock()
-	if !b.Alive {
-		return math.MaxFloat64
-	}
-	return b.Health.LoadScore
+	return b.Health.LoadScore + float64(inflight)*1.5
 }
 
 func (b *Backend) UpdateHealth(h HealthData) {
@@ -132,19 +230,13 @@ func (b *Backend) UpdateHealth(h HealthData) {
 	b.Health = h
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ServerPool: dynamic performance-based routing
-// ─────────────────────────────────────────────────────────────────────────────
-
 type ServerPool struct {
 	backends  []*Backend
 	threshold float64
 	mu        sync.RWMutex
+	store     *MessageStore
 }
 
-// SelectBest picks the backend with lowest effective load score (health + in-flight).
-// If all exceed threshold, picks least loaded.
-// Never returns nil if any backend exists.
 func (s *ServerPool) SelectBest() *Backend {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -179,7 +271,6 @@ func (s *ServerPool) SelectBest() *Backend {
 	if overloaded != nil {
 		return overloaded
 	}
-	// Fallback: if all marked down, return random backend to retry
 	if len(s.backends) > 0 {
 		return s.backends[mrand.Intn(len(s.backends))]
 	}
@@ -214,64 +305,79 @@ func (s *ServerPool) AdaptThreshold() {
 	if newThreshold < 30 {
 		newThreshold = 30
 	}
-	if newThreshold > 85 {
-		newThreshold = 85
+	if newThreshold > 90 {
+		newThreshold = 90
 	}
 	s.threshold = newThreshold
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP Client optimized for 1,000+ concurrent connections
-// ─────────────────────────────────────────────────────────────────────────────
-
 var httpClient = &http.Client{
-	Timeout: 18000 * time.Millisecond,
+	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        10000,
-		MaxIdleConnsPerHost: 2000,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 200,
+		IdleConnTimeout:     30 * time.Second,
 		DisableKeepAlives:   false,
 	},
 }
 
 var feedHttpClient = &http.Client{
-	Timeout: 25 * time.Second,
+	Timeout: 10 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     60 * time.Second,
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     30 * time.Second,
 	},
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Background Replication Queue
-// Replicates messages asynchronously to peer backends without slowing clients.
-// ─────────────────────────────────────────────────────────────────────────────
-
 type ReplicationTask struct {
-	BackendURL string
-	Payload    url.Values
+	MsgID      string
+	ClientName string
+	MsgText    string
 }
 
-var replicationCh = make(chan ReplicationTask, 50000)
+var replicationCh = make(chan ReplicationTask, 100000)
 
-func startReplicationWorkers(numWorkers int) {
+func startReplicationWorkers(pool *ServerPool, numWorkers int) {
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			for task := range replicationCh {
-				resp, err := httpClient.PostForm(task.BackendURL+"/message", task.Payload)
-				if err == nil {
+				target := pool.SelectBest()
+				if target == nil {
+					continue
+				}
+
+				payload := url.Values{
+					"client-name": {task.ClientName},
+					"msg":         {task.MsgText},
+					"msg_id":      {task.MsgID},
+				}
+
+				atomic.AddInt64(&target.ActiveInFlight, 1)
+				resp, err := httpClient.PostForm(target.URL+"/message", payload)
+				atomic.AddInt64(&target.ActiveInFlight, -1)
+
+				if err == nil && resp != nil {
 					io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
+					if resp.StatusCode < 400 {
+						target.RecordSuccess()
+						atomic.AddInt64(&target.TotalServed, 1)
+					} else {
+						target.RecordFailure()
+						atomic.AddInt64(&target.TotalErrors, 1)
+					}
+				} else {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					target.RecordFailure()
+					atomic.AddInt64(&target.TotalErrors, 1)
 				}
 			}
 		}()
 	}
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Health Checking
-// ─────────────────────────────────────────────────────────────────────────────
 
 func healthCheck(pool *ServerPool, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -301,75 +407,14 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Route message to best backend, then queue async replication
-// ─────────────────────────────────────────────────────────────────────────────
-
-func routeMessage(pool *ServerPool, msgID, clientName, msgText string) (string, error) {
-	payload := url.Values{
-		"client-name": {clientName},
-		"msg":         {msgText},
-		"msg_id":      {msgID},
-	}
-
-	for attempt := 0; attempt < 3; attempt++ {
-		target := pool.SelectBest()
-		if target == nil {
-			time.Sleep(25 * time.Millisecond)
-			continue
-		}
-
-		atomic.AddInt64(&target.ActiveInFlight, 1)
-		resp, err := httpClient.PostForm(target.URL+"/message", payload)
-		atomic.AddInt64(&target.ActiveInFlight, -1)
-
-		if err == nil && resp != nil && resp.StatusCode < 400 {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			target.RecordSuccess()
-			atomic.AddInt64(&target.TotalServed, 1)
-			return target.URL, nil
-		}
-
-		if resp != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-		target.RecordFailure()
-		atomic.AddInt64(&target.TotalErrors, 1)
-
-		if attempt < 2 {
-			time.Sleep(30 * time.Millisecond)
-		}
-	}
-
-	return "", fmt.Errorf("all backends busy")
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Request counters
-// ─────────────────────────────────────────────────────────────────────────────
-
 var (
 	totalRequests int64
 	totalErrors   int64
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP Handler
-// ─────────────────────────────────────────────────────────────────────────────
-
-type FeedMessage struct {
-	ID         string `json:"id"`
-	ClientName string `json:"client-name"`
-	Msg        string `json:"msg"`
-	Timestamp  int64  `json:"timestamp"`
-}
-
 func makeHandler(pool *ServerPool) http.Handler {
 	mux := http.NewServeMux()
 
-	// ── POST /message ────────────────────────────────────────────────────────
 	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
 		t0 := time.Now()
@@ -379,10 +424,14 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		var clientName, msgText string
-		bodyBytes, _ := io.ReadAll(r.Body)
+		var clientName, msgText, msgID string
 
-		// 1. Try JSON decode
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+			return
+		}
+
 		var jsonBody map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &jsonBody); err == nil && len(jsonBody) > 0 {
 			if v, ok := jsonBody["client-name"]; ok {
@@ -395,9 +444,13 @@ func makeHandler(pool *ServerPool) http.Handler {
 			} else if v, ok := jsonBody["text"]; ok {
 				msgText = fmt.Sprint(v)
 			}
+			if v, ok := jsonBody["msg_id"]; ok {
+				msgID = fmt.Sprint(v)
+			} else if v, ok := jsonBody["id"]; ok {
+				msgID = fmt.Sprint(v)
+			}
 		}
 
-		// 2. Try Form URL-encoded
 		if clientName == "" || msgText == "" {
 			vals, err := url.ParseQuery(string(bodyBytes))
 			if err == nil && len(vals) > 0 {
@@ -413,6 +466,12 @@ func makeHandler(pool *ServerPool) http.Handler {
 						msgText = vals.Get("text")
 					}
 				}
+				if msgID == "" {
+					msgID = vals.Get("msg_id")
+					if msgID == "" {
+						msgID = vals.Get("id")
+					}
+				}
 			}
 		}
 
@@ -425,27 +484,39 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		msgID := newUUID()
-		backendURL, err := routeMessage(pool, msgID, clientName, msgText)
-		if err != nil {
-			atomic.AddInt64(&totalErrors, 1)
-			http.Error(w, `{"error":"service unavailable"}`, http.StatusServiceUnavailable)
-			return
+		if msgID == "" {
+			msgID = newUUID()
+		}
+
+		nowMs := time.Now().UnixMilli()
+		feedMsg := FeedMessage{
+			ID:         msgID,
+			ClientName: clientName,
+			Msg:        msgText,
+			Timestamp:  nowMs,
+		}
+
+		pool.store.Add(feedMsg)
+
+		select {
+		case replicationCh <- ReplicationTask{MsgID: msgID, ClientName: clientName, MsgText: msgText}:
+		default:
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+
+		respBytes, _ := json.Marshal(map[string]interface{}{
 			"status":      "ok",
 			"msg_id":      msgID,
 			"client-name": clientName,
 			"msg":         msgText,
-			"backend":     backendURL,
+			"timestamp":   nowMs,
 			"latency_ms":  time.Since(t0).Milliseconds(),
 		})
+		w.Write(respBytes)
 	})
 
-	// ── GET /feed (Merges all backends for 100% completeness) ─────────────────
 	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
 
@@ -454,38 +525,34 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		backends := pool.GetAll()
-		type feedResult struct {
-			msgs []FeedMessage
-			err  error
-		}
+		allMsgs := pool.store.GetAll()
 
-		ch := make(chan feedResult, len(backends))
-
-		for _, b := range backends {
-			go func(backendURL string) {
-				resp, err := feedHttpClient.Get(backendURL + "/feed")
-				if err != nil || resp.StatusCode != http.StatusOK {
-					if resp != nil {
-						resp.Body.Close()
+		if len(allMsgs) == 0 {
+			backends := pool.GetAll()
+			type feedResult struct {
+				msgs []FeedMessage
+			}
+			ch := make(chan feedResult, len(backends))
+			for _, b := range backends {
+				go func(backendURL string) {
+					resp, err := feedHttpClient.Get(backendURL + "/feed")
+					if err != nil || resp.StatusCode != http.StatusOK {
+						if resp != nil {
+							resp.Body.Close()
+						}
+						ch <- feedResult{nil}
+						return
 					}
-					ch <- feedResult{nil, fmt.Errorf("failed")}
-					return
-				}
-				defer resp.Body.Close()
-				var msgs []FeedMessage
-				json.NewDecoder(resp.Body).Decode(&msgs)
-				ch <- feedResult{msgs, nil}
-			}(b.URL)
-		}
+					defer resp.Body.Close()
+					var msgs []FeedMessage
+					json.NewDecoder(resp.Body).Decode(&msgs)
+					ch <- feedResult{msgs}
+				}(b.URL)
+			}
 
-		// Collect and merge messages from all backends
-		seen := make(map[string]bool)
-		merged := make([]FeedMessage, 0)
-
-		for range backends {
-			res := <-ch
-			if res.err == nil && res.msgs != nil {
+			seen := make(map[string]bool)
+			for range backends {
+				res := <-ch
 				for _, m := range res.msgs {
 					key := m.ID
 					if key == "" {
@@ -493,23 +560,42 @@ func makeHandler(pool *ServerPool) http.Handler {
 					}
 					if !seen[key] {
 						seen[key] = true
-						merged = append(merged, m)
+						allMsgs = append(allMsgs, m)
+						pool.store.Add(m)
 					}
 				}
 			}
 		}
 
-		// Sort merged messages by timestamp ascending
-		sort.Slice(merged, func(i, j int) bool {
-			return merged[i].Timestamp < merged[j].Timestamp
+		sort.Slice(allMsgs, func(i, j int) bool {
+			return allMsgs[i].Timestamp < allMsgs[j].Timestamp
 		})
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(merged)
+		json.NewEncoder(w).Encode(allMsgs)
 	})
 
-	// ── GET /lb-stats ─────────────────────────────────────────────────────────
+	mux.HandleFunc("/reset-state", func(w http.ResponseWriter, r *http.Request) {
+		pool.store.Reset()
+
+		for _, b := range pool.GetAll() {
+			go func(url string) {
+				req, _ := http.NewRequest(http.MethodPost, url+"/reset-state", nil)
+				resp, err := httpClient.Do(req)
+				if err == nil && resp != nil {
+					resp.Body.Close()
+				}
+			}(b.URL)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"message": "load balancer state reset complete",
+		})
+	})
+
 	mux.HandleFunc("/lb-stats", func(w http.ResponseWriter, r *http.Request) {
 		pool.mu.RLock()
 		defer pool.mu.RUnlock()
@@ -536,27 +622,24 @@ func makeHandler(pool *ServerPool) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"threshold":      pool.threshold,
+			"stored_msgs":    pool.store.Count(),
 			"total_requests": atomic.LoadInt64(&totalRequests),
 			"total_errors":   atomic.LoadInt64(&totalErrors),
 			"backends":       stats,
 		})
 	})
 
-	// ── GET /health (LB itself) ───────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "ok",
-			"role":   "load-balancer",
+			"status":      "ok",
+			"role":        "load-balancer",
+			"stored_msgs": pool.store.Count(),
 		})
 	})
 
 	return mux
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
 	port := flag.Int("port", 3000, "Load Balancer listening port")
@@ -564,10 +647,14 @@ func main() {
 		"http://172.17.0.11:4000,http://172.17.0.12:3000,http://172.17.0.13:3000",
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
+	logFilePath := flag.String("logfile", "/home/student/chat_messages.jsonl", "Append-only message log file")
 	flag.Parse()
+
+	store := NewMessageStore(*logFilePath)
 
 	pool := &ServerPool{
 		threshold: *thresholdFlag,
+		store:     store,
 	}
 
 	for _, rawURL := range strings.Split(*backendsStr, ",") {
@@ -582,20 +669,17 @@ func main() {
 		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
-	// Start background health checker
+	startReplicationWorkers(pool, 32)
 	go healthCheck(pool, 2*time.Second)
-
-	time.Sleep(1 * time.Second)
 
 	handler := makeHandler(pool)
 
-	// Listen on port 3210
 	go func() {
 		sDual := &http.Server{
 			Addr:         "0.0.0.0:3210",
 			Handler:      handler,
-			ReadTimeout:  20 * time.Second,
-			WriteTimeout: 30 * time.Second,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 20 * time.Second,
 			IdleTimeout:  60 * time.Second,
 		}
 		log.Printf("[DUAL] Also listening on http://0.0.0.0:3210")
@@ -604,13 +688,12 @@ func main() {
 		}
 	}()
 
-	// Listen on port 3109
 	go func() {
 		s3109 := &http.Server{
 			Addr:         "0.0.0.0:3109",
 			Handler:      handler,
-			ReadTimeout:  20 * time.Second,
-			WriteTimeout: 30 * time.Second,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 20 * time.Second,
 			IdleTimeout:  60 * time.Second,
 		}
 		log.Printf("[PORT] Also listening on http://0.0.0.0:3109")
@@ -620,18 +703,18 @@ func main() {
 	}()
 
 	server := &http.Server{
-		Addr:         "0.0.0.0:3000",
+		Addr:         fmt.Sprintf("0.0.0.0:%d", *port),
 		Handler:      handler,
-		ReadTimeout:  20 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 20 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
 	log.Printf("==========================================")
-	log.Printf("  Lab 6 High-Performance Dynamic Load Balancer")
-	log.Printf("  Listening: http://0.0.0.0:%d and http://0.0.0.0:3000", *port)
+	log.Printf("  Lab 6 Ultra-Performance Dynamic Load Balancer")
+	log.Printf("  Listening: http://0.0.0.0:%d, 3109, 3210", *port)
 	log.Printf("  Threshold: %.0f  |  Backends: %d", pool.threshold, len(pool.backends))
-	log.Printf("  Routes: POST /message  GET /feed  GET /lb-stats")
+	log.Printf("  Durability Log: %s", *logFilePath)
 	log.Printf("==========================================")
 
 	if err := server.ListenAndServe(); err != nil {
