@@ -46,3 +46,4 @@ stress_test*.py
 benchmark/
 cipher-test.py
 key-tampering.py
+LOAD_BALANCER_FIX_GUIDE.txt

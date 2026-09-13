@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -197,6 +198,19 @@ func (ms *MessageStore) Add(msg FeedMessage) bool {
 }
 
 func (ms *MessageStore) GetFeedBytes() []byte {
+	if atomic.LoadInt32(&ms.dirty) == 1 {
+		ms.mu.Lock()
+		if ms.dirty == 1 {
+			n := len(ms.messages)
+			msgsCopy := make([]FeedMessage, n)
+			copy(msgsCopy, ms.messages)
+			if data, err := json.Marshal(msgsCopy); err == nil {
+				ms.feedBytes.Store(&data)
+				atomic.StoreInt32(&ms.dirty, 0)
+			}
+		}
+		ms.mu.Unlock()
+	}
 	ptr := ms.feedBytes.Load()
 	if ptr != nil {
 		return *ptr
@@ -410,9 +424,9 @@ func (s *ServerPool) AdaptThreshold() {
 var httpClient = &http.Client{
 	Timeout: 4 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 25,
-		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:        5000,
+		MaxIdleConnsPerHost: 2000,
+		IdleConnTimeout:     90 * time.Second,
 		DisableKeepAlives:   false,
 	},
 }
@@ -652,6 +666,17 @@ func createCustomListener(addr string) (net.Listener, error) {
 }
 
 func main() {
+	// Ignore SIGHUP and SIGPIPE to stay alive on disconnects or broken sockets
+	signal.Ignore(syscall.SIGHUP, syscall.SIGPIPE)
+
+	// Set file descriptor limits to maximum
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err == nil {
+		rLimit.Cur = 65536
+		rLimit.Max = 65536
+		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	}
+
 	// 300 MB heap cap ensures maximum headroom within 512 MB cgroup without GC thrashing
 	debug.SetMemoryLimit(300 * 1024 * 1024)
 	debug.SetGCPercent(100)
