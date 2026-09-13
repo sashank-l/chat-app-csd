@@ -297,6 +297,8 @@ def reset_state():
         _last_hash_val = "0" * 64
     with _keypair_lock:
         _keypair_cache.clear()
+    import gc
+    gc.collect()
     return jsonify({"status": "ok", "message": "database reset complete"}), 200
 
 

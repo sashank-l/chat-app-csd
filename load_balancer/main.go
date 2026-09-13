@@ -55,10 +55,10 @@ type MessageStore struct {
 
 func NewMessageStore(filePath string) *MessageStore {
 	ms := &MessageStore{
-		messages: make([]FeedMessage, 0, 100000),
-		seen:     make(map[string]bool, 100000),
+		messages: make([]FeedMessage, 0, 30000),
+		seen:     make(map[string]bool, 30000),
 		filePath: filePath,
-		diskCh:   make(chan FeedMessage, 100000),
+		diskCh:   make(chan FeedMessage, 5000),
 	}
 
 	// Recover existing messages from disk if available
@@ -182,10 +182,7 @@ func (ms *MessageStore) GetFeedBytes() []byte {
 	if atomic.LoadInt32(&ms.dirty) == 1 {
 		ms.mu.Lock()
 		if ms.dirty == 1 {
-			n := len(ms.messages)
-			msgsCopy := make([]FeedMessage, n)
-			copy(msgsCopy, ms.messages)
-			if data, err := json.Marshal(msgsCopy); err == nil {
+			if data, err := json.Marshal(ms.messages); err == nil {
 				ms.feedBytes.Store(&data)
 				atomic.StoreInt32(&ms.dirty, 0)
 			}
@@ -215,8 +212,8 @@ func (ms *MessageStore) Count() int {
 
 func (ms *MessageStore) Reset() {
 	ms.mu.Lock()
-	ms.messages = make([]FeedMessage, 0, 100000)
-	ms.seen = make(map[string]bool, 100000)
+	ms.messages = make([]FeedMessage, 0, 30000)
+	ms.seen = make(map[string]bool, 30000)
 	empty := []byte("[]")
 	ms.feedBytes.Store(&empty)
 	atomic.StoreInt32(&ms.dirty, 0)
@@ -230,6 +227,8 @@ func (ms *MessageStore) Reset() {
 	}
 
 	ms.diskCh <- FeedMessage{ID: "__RESET__"}
+	_ = os.Truncate(ms.filePath, 0)
+	debug.FreeOSMemory()
 	log.Printf("[STORE] Message store reset complete")
 }
 
@@ -451,6 +450,13 @@ var dispatchClient = &http.Client{
 	},
 }
 
+type DispatchMsg struct {
+	MsgID      string `json:"msg_id"`
+	ClientName string `json:"client-name"`
+	Msg        string `json:"msg"`
+	Timestamp  int64  `json:"timestamp"`
+}
+
 func startDispatchWorkers(pool *ServerPool, workers int) {
 	for i := 0; i < workers; i++ {
 		go func() {
@@ -461,12 +467,13 @@ func startDispatchWorkers(pool *ServerPool, workers int) {
 				}
 				atomic.AddInt64(&backend.ActiveInFlight, 1)
 
-				payload, err := json.Marshal(map[string]interface{}{
-					"msg_id":      msg.ID,
-					"client-name": msg.ClientName,
-					"msg":         msg.Msg,
-					"timestamp":   msg.Timestamp,
-				})
+				dm := DispatchMsg{
+					MsgID:      msg.ID,
+					ClientName: msg.ClientName,
+					Msg:        msg.Msg,
+					Timestamp:  msg.Timestamp,
+				}
+				payload, err := json.Marshal(dm)
 				if err == nil {
 					req, reqErr := http.NewRequest(http.MethodPost, backend.URL+"/message", strings.NewReader(string(payload)))
 					if reqErr == nil {
@@ -740,7 +747,7 @@ func main() {
 	pool := &ServerPool{
 		threshold:  *thresholdFlag,
 		store:      store,
-		dispatchCh: make(chan FeedMessage, 50000),
+		dispatchCh: make(chan FeedMessage, 5000),
 	}
 	startDispatchWorkers(pool, 4)
 
