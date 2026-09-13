@@ -4,8 +4,11 @@ import queue
 import sqlite3
 import threading
 import time
+import urllib.request
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.db")
+DB_SERVICE_URL = os.getenv("DB_SERVICE_URL", "http://172.17.0.11:4000")
+IS_SHARED_DB_HOST = os.getenv("IS_SHARED_DB_HOST", "false").lower() == "true"
 
 _conn = None
 _conn_pid = None
@@ -74,6 +77,34 @@ def _background_writer():
                         batch
                     )
                     conn.commit()
+
+                # Replicate batch to Central Shared DBaaS (Part 3 Step 2 of fix guide)
+                if DB_SERVICE_URL and not IS_SHARED_DB_HOST:
+                    try:
+                        payload = [
+                            {
+                                "msg_id": r[0],
+                                "username": r[1],
+                                "display_name": r[1],
+                                "plaintext": r[2],
+                                "ciphertext": r[3],
+                                "signature": r[4],
+                                "pubkey_jwk": r[5],
+                                "timestamp": str(r[6]),
+                                "prev_hash": r[7],
+                                "hmac_digest": r[8]
+                            }
+                            for r in batch
+                        ]
+                        req = urllib.request.Request(
+                            f"{DB_SERVICE_URL}/messages/batch",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "User-Agent": "BackendReplicator/1.0"}
+                        )
+                        with urllib.request.urlopen(req, timeout=2.0) as resp:
+                            pass
+                    except Exception:
+                        pass
         except queue.Empty:
             continue
         except Exception:
@@ -261,3 +292,71 @@ def upsert_user_pubkey(username, pubkey_jwk_str):
             (username, pubkey_jwk_str)
         )
         conn.commit()
+
+
+def save_messages_batch(batch):
+    """
+    Ingest a batch of messages into SQLite database and RAM feed cache.
+    Used by Central Shared DBaaS endpoint POST /messages/batch.
+    """
+    if not batch:
+        return 0
+
+    rows = []
+    feed_items = []
+    new_seen = []
+
+    for item in batch:
+        msg_id = str(item.get("msg_id") or item.get("id") or "")
+        if not msg_id:
+            continue
+        username = str(item.get("username") or item.get("display_name") or item.get("client-name") or "")
+        plaintext = str(item.get("plaintext") or item.get("msg") or item.get("text") or "")
+        ciphertext = str(item.get("ciphertext") or "")
+        signature = str(item.get("signature") or "")
+        pubkey_jwk = str(item.get("pubkey_jwk") or "")
+        try:
+            timestamp = int(item.get("timestamp") or time.time() * 1000)
+        except (ValueError, TypeError):
+            timestamp = int(time.time() * 1000)
+        prev_hash = str(item.get("prev_hash") or "")
+        record_hash = str(item.get("record_hash") or item.get("hmac_digest") or "")
+
+        rows.append((msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash))
+        feed_items.append((msg_id, username, plaintext, timestamp))
+        new_seen.append(msg_id)
+
+    if not rows:
+        return 0
+
+    with _db_lock:
+        conn = get_conn()
+        conn.executemany(
+            """INSERT OR IGNORE INTO messages
+               (msg_id, username, plaintext, ciphertext, signature, pubkey_jwk, timestamp, prev_hash, record_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows
+        )
+        conn.commit()
+
+    with _seen_lock:
+        for mid in new_seen:
+            _seen_msg_ids.add(mid)
+
+    with _feed_lock:
+        _memory_feed.extend(feed_items)
+
+    return len(rows)
+
+
+def load_shared_messages(limit=100000):
+    """Load messages formatted for cross-server inspection (GET /messages)."""
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.execute(
+            """SELECT id, msg_id, username, username AS display_name, ciphertext, signature, 
+                      record_hash AS hmac_digest, timestamp, plaintext 
+               FROM messages ORDER BY id ASC LIMIT ?""",
+            (limit,)
+        )
+        return [dict(r) for r in cur.fetchall()]

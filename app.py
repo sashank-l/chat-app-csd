@@ -295,6 +295,31 @@ def reset_state():
     return jsonify({"status": "ok", "message": "database reset complete"}), 200
 
 
+@app.route("/messages/batch", methods=["POST"])
+def post_messages_batch():
+    """
+    Central Shared DB endpoint: accepts batch of message records from any backend
+    and persists them into the shared SQLite database in a single transaction.
+    """
+    batch = request.get_json(silent=True) or []
+    if not isinstance(batch, list) or not batch:
+        return jsonify({"status": "ok", "inserted": 0}), 200
+
+    inserted = db.save_messages_batch(batch)
+    return jsonify({"status": "ok", "inserted": inserted}), 200
+
+
+@app.route("/messages", methods=["GET"])
+def get_messages():
+    """
+    Returns all stored messages for cross-server inspection or verification.
+    curl -s http://.../messages | jq '.[-1]'
+    """
+    limit = request.args.get("limit", 100000, type=int)
+    messages = db.load_shared_messages(limit=limit)
+    return jsonify(messages), 200
+
+
 # ─────────────────────────────────────────────
 # Legacy WebSocket route (kept for browser UI)
 # ─────────────────────────────────────────────

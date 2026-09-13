@@ -341,10 +341,11 @@ func (b *Backend) UpdateHealth(h HealthData) {
 }
 
 type ServerPool struct {
-	backends  []*Backend
-	threshold float64
-	mu        sync.RWMutex
-	store     *MessageStore
+	backends   []*Backend
+	threshold  float64
+	mu         sync.RWMutex
+	store      *MessageStore
+	dispatchCh chan FeedMessage
 }
 
 func (s *ServerPool) SelectBest() *Backend {
@@ -459,6 +460,45 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 	}
 }
 
+func startDispatchWorkers(pool *ServerPool, workers int) {
+	for i := 0; i < workers; i++ {
+		go func() {
+			for msg := range pool.dispatchCh {
+				backend := pool.SelectBest()
+				if backend == nil {
+					continue
+				}
+				atomic.AddInt64(&backend.ActiveInFlight, 1)
+
+				payload, err := json.Marshal(map[string]interface{}{
+					"msg_id":      msg.ID,
+					"client-name": msg.ClientName,
+					"msg":         msg.Msg,
+					"timestamp":   msg.Timestamp,
+				})
+				if err == nil {
+					req, reqErr := http.NewRequest(http.MethodPost, backend.URL+"/message", strings.NewReader(string(payload)))
+					if reqErr == nil {
+						req.Header.Set("Content-Type", "application/json")
+						resp, doErr := httpClient.Do(req)
+						if doErr == nil && resp != nil {
+							_ = resp.Body.Close()
+							if resp.StatusCode == http.StatusOK {
+								backend.RecordSuccess()
+							} else {
+								backend.RecordFailure()
+							}
+						} else {
+							backend.RecordFailure()
+						}
+					}
+				}
+				atomic.AddInt64(&backend.ActiveInFlight, -1)
+			}
+		}()
+	}
+}
+
 var (
 	totalRequests int64
 	totalErrors   int64
@@ -562,6 +602,12 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		pool.store.Add(feedMsg)
 
+		// Non-blocking asynchronous dispatch to backend servers (Part 2 of fix guide)
+		select {
+		case pool.dispatchCh <- feedMsg:
+		default:
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"ok","msg_id":"%s","client-name":"%s","timestamp":%d}`, msgID, clientName, nowMs)
@@ -587,6 +633,14 @@ func makeHandler(pool *ServerPool) http.Handler {
 	// ── POST /reset-state ────────────────────────────────────────────────────
 	mux.HandleFunc("/reset-state", func(w http.ResponseWriter, r *http.Request) {
 		pool.store.Reset()
+
+		// Drain pending dispatch queue
+		for len(pool.dispatchCh) > 0 {
+			select {
+			case <-pool.dispatchCh:
+			default:
+			}
+		}
 
 		for _, b := range pool.GetAll() {
 			go func(url string) {
@@ -683,7 +737,7 @@ func main() {
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
-		"http://172.17.0.12:3000,http://172.17.0.13:3000",
+		"http://172.17.0.11:4000,http://172.17.0.12:3000,http://172.17.0.13:3000",
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
 	logFilePath := flag.String("logfile", "/home/student/chat_messages.jsonl", "Append-only message log file")
@@ -692,9 +746,11 @@ func main() {
 	store := NewMessageStore(*logFilePath)
 
 	pool := &ServerPool{
-		threshold: *thresholdFlag,
-		store:     store,
+		threshold:  *thresholdFlag,
+		store:      store,
+		dispatchCh: make(chan FeedMessage, 50000),
 	}
+	startDispatchWorkers(pool, 8)
 
 	for _, rawURL := range strings.Split(*backendsStr, ",") {
 		rawURL = strings.TrimSpace(rawURL)
