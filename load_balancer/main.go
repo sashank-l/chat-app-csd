@@ -589,13 +589,13 @@ func main() {
 
 	handler := makeHandler(pool)
 
-	// Ensure LB listens on BOTH port 3000 and port 3210
+	// Listen on port 3210
 	go func() {
 		sDual := &http.Server{
 			Addr:         "0.0.0.0:3210",
 			Handler:      handler,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 15 * time.Second,
+			ReadTimeout:  20 * time.Second,
+			WriteTimeout: 30 * time.Second,
 			IdleTimeout:  60 * time.Second,
 		}
 		log.Printf("[DUAL] Also listening on http://0.0.0.0:3210")
@@ -604,11 +604,26 @@ func main() {
 		}
 	}()
 
+	// Listen on port 3109
+	go func() {
+		s3109 := &http.Server{
+			Addr:         "0.0.0.0:3109",
+			Handler:      handler,
+			ReadTimeout:  20 * time.Second,
+			WriteTimeout: 30 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		log.Printf("[PORT] Also listening on http://0.0.0.0:3109")
+		if err := s3109.ListenAndServe(); err != nil {
+			log.Printf("[PORT] Port 3109 listener: %v", err)
+		}
+	}()
+
 	server := &http.Server{
 		Addr:         "0.0.0.0:3000",
 		Handler:      handler,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  20 * time.Second,
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
