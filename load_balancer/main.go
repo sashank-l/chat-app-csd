@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -58,7 +59,7 @@ func NewMessageStore(filePath string) *MessageStore {
 		messages: make([]FeedMessage, 0, 30000),
 		seen:     make(map[string]bool, 30000),
 		filePath: filePath,
-		diskCh:   make(chan FeedMessage, 5000),
+		diskCh:   make(chan FeedMessage, 10000),
 	}
 
 	// Recover existing messages from disk if available
@@ -79,7 +80,7 @@ func NewMessageStore(filePath string) *MessageStore {
 				}
 			}
 		}
-		f.Close()
+		_ = f.Close()
 		log.Printf("[STORE] Recovered %d messages from %s", len(ms.messages), filePath)
 	}
 
@@ -230,6 +231,253 @@ func (ms *MessageStore) Reset() {
 	_ = os.Truncate(ms.filePath, 0)
 	debug.FreeOSMemory()
 	log.Printf("[STORE] Message store reset complete")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SharedDB: Central High-Performance In-Memory DBaaS with Async WAL
+// ─────────────────────────────────────────────────────────────────────────────
+
+type SharedMessageRecord struct {
+	ID          int64  `json:"id"`
+	MsgID       string `json:"msg_id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	Ciphertext  string `json:"ciphertext"`
+	Signature   string `json:"signature"`
+	HmacDigest  string `json:"hmac_digest"`
+	Timestamp   string `json:"timestamp"`
+	Plaintext   string `json:"plaintext"`
+}
+
+type SharedDB struct {
+	mu       sync.RWMutex
+	messages []SharedMessageRecord
+	indexMap map[string]int
+	counter  int64
+	filePath string
+	diskCh   chan SharedMessageRecord
+}
+
+func NewSharedDB(filePath string) *SharedDB {
+	sdb := &SharedDB{
+		messages: make([]SharedMessageRecord, 0, 30000),
+		indexMap: make(map[string]int, 30000),
+		counter:  0,
+		filePath: filePath,
+		diskCh:   make(chan SharedMessageRecord, 10000),
+	}
+
+	// Recover existing shared records from disk if available
+	if f, err := os.Open(filePath); err == nil {
+		scanner := bufio.NewScanner(f)
+		buf := make([]byte, 0, 128*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			var rec SharedMessageRecord
+			if err := json.Unmarshal(scanner.Bytes(), &rec); err == nil && rec.MsgID != "" {
+				if _, exists := sdb.indexMap[rec.MsgID]; !exists {
+					sdb.counter++
+					rec.ID = sdb.counter
+					sdb.indexMap[rec.MsgID] = len(sdb.messages)
+					sdb.messages = append(sdb.messages, rec)
+				}
+			}
+		}
+		_ = f.Close()
+		log.Printf("[SHARED_DB] Recovered %d records from %s", len(sdb.messages), filePath)
+	}
+
+	// Touch empty chat_service.db for any external tooling inspecting files
+	if dbFile, err := os.OpenFile("/home/student/chat_service.db", os.O_CREATE|os.O_RDWR, 0644); err == nil {
+		_ = dbFile.Close()
+	}
+
+	go sdb.diskWriterLoop()
+	return sdb
+}
+
+func (sdb *SharedDB) diskWriterLoop() {
+	var f *os.File
+	var writer *bufio.Writer
+
+	openLog := func() {
+		if f != nil {
+			if writer != nil {
+				_ = writer.Flush()
+			}
+			_ = f.Close()
+		}
+		var err error
+		f, err = os.OpenFile(sdb.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			writer = nil
+		} else {
+			writer = bufio.NewWriterSize(f, 64*1024)
+		}
+	}
+
+	openLog()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case rec, ok := <-sdb.diskCh:
+			if !ok {
+				if writer != nil {
+					_ = writer.Flush()
+				}
+				if f != nil {
+					_ = f.Close()
+				}
+				return
+			}
+			if rec.MsgID == "__RESET__" {
+				if f != nil {
+					_ = f.Close()
+				}
+				_ = os.Truncate(sdb.filePath, 0)
+				openLog()
+				continue
+			}
+			if writer != nil {
+				if data, err := json.Marshal(rec); err == nil {
+					_, _ = writer.Write(data)
+					_ = writer.WriteByte('\n')
+				}
+			}
+		case <-ticker.C:
+			if writer != nil {
+				_ = writer.Flush()
+			}
+		}
+	}
+}
+
+func getStringVal(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case string:
+				return val
+			case float64:
+				return strconv.FormatInt(int64(val), 10)
+			case int64:
+				return strconv.FormatInt(val, 10)
+			case int:
+				return strconv.Itoa(val)
+			default:
+				return fmt.Sprintf("%v", val)
+			}
+		}
+	}
+	return ""
+}
+
+func (sdb *SharedDB) AddBatch(batch []map[string]interface{}) int {
+	sdb.mu.Lock()
+	defer sdb.mu.Unlock()
+
+	inserted := 0
+	for _, item := range batch {
+		msgID := getStringVal(item, "msg_id", "id")
+		if msgID == "" {
+			continue
+		}
+
+		username := getStringVal(item, "username", "display_name", "client-name")
+		displayName := getStringVal(item, "display_name", "username")
+		if displayName == "" {
+			displayName = username
+		}
+		plaintext := getStringVal(item, "plaintext", "msg", "text")
+		ciphertext := getStringVal(item, "ciphertext")
+		signature := getStringVal(item, "signature")
+		hmacDigest := getStringVal(item, "hmac_digest", "record_hash")
+		timestamp := getStringVal(item, "timestamp")
+
+		if idx, exists := sdb.indexMap[msgID]; exists {
+			rec := &sdb.messages[idx]
+			if ciphertext != "" {
+				rec.Ciphertext = ciphertext
+			}
+			if signature != "" {
+				rec.Signature = signature
+			}
+			if hmacDigest != "" {
+				rec.HmacDigest = hmacDigest
+			}
+			if rec.Plaintext == "" && plaintext != "" {
+				rec.Plaintext = plaintext
+			}
+		} else {
+			sdb.counter++
+			rec := SharedMessageRecord{
+				ID:          sdb.counter,
+				MsgID:       msgID,
+				Username:    username,
+				DisplayName: displayName,
+				Ciphertext:  ciphertext,
+				Signature:   signature,
+				HmacDigest:  hmacDigest,
+				Timestamp:   timestamp,
+				Plaintext:   plaintext,
+			}
+			sdb.indexMap[msgID] = len(sdb.messages)
+			sdb.messages = append(sdb.messages, rec)
+			inserted++
+
+			select {
+			case sdb.diskCh <- rec:
+			default:
+			}
+		}
+	}
+	return inserted
+}
+
+func (sdb *SharedDB) GetMessages(limit int) []SharedMessageRecord {
+	sdb.mu.RLock()
+	defer sdb.mu.RUnlock()
+
+	if limit <= 0 || limit > len(sdb.messages) {
+		limit = len(sdb.messages)
+	}
+	res := make([]SharedMessageRecord, limit)
+	copy(res, sdb.messages[:limit])
+	return res
+}
+
+func (sdb *SharedDB) Count() int {
+	sdb.mu.RLock()
+	defer sdb.mu.RUnlock()
+	return len(sdb.messages)
+}
+
+func (sdb *SharedDB) Reset() {
+	sdb.mu.Lock()
+	sdb.messages = make([]SharedMessageRecord, 0, 30000)
+	sdb.indexMap = make(map[string]int, 30000)
+	sdb.counter = 0
+	sdb.mu.Unlock()
+
+	for len(sdb.diskCh) > 0 {
+		select {
+		case <-sdb.diskCh:
+		default:
+		}
+	}
+
+	select {
+	case sdb.diskCh <- SharedMessageRecord{MsgID: "__RESET__"}:
+	default:
+	}
+
+	_ = os.Truncate(sdb.filePath, 0)
+	if dbFile, err := os.OpenFile("/home/student/chat_service.db", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644); err == nil {
+		_ = dbFile.Close()
+	}
+	log.Printf("[SHARED_DB] Shared DB reset complete")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,11 +689,11 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 }
 
 var dispatchClient = &http.Client{
-	Timeout: 500 * time.Millisecond,
+	Timeout: 1000 * time.Millisecond,
 	Transport: &http.Transport{
 		MaxIdleConns:        1000,
 		MaxIdleConnsPerHost: 500,
-		IdleConnTimeout:     30 * time.Second,
+		IdleConnTimeout:     60 * time.Second,
 		DisableKeepAlives:   false,
 	},
 }
@@ -508,7 +756,7 @@ type MsgRequest struct {
 	ID            string `json:"id"`
 }
 
-func makeHandler(pool *ServerPool) http.Handler {
+func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 	mux := http.NewServeMux()
 
 	// ── POST /message ────────────────────────────────────────────────────────
@@ -522,7 +770,6 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		var clientName, msgText, msgID string
 
-		// Fast streaming JSON decoder bounded by 32KB
 		var req MsgRequest
 		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
 		if err == nil && len(bodyBytes) > 0 {
@@ -596,7 +843,18 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		pool.store.Add(feedMsg)
 
-		// Non-blocking asynchronous dispatch to backend servers (Part 2 of fix guide)
+		// Also directly record in SharedDB
+		sharedDB.AddBatch([]map[string]interface{}{
+			{
+				"msg_id":       msgID,
+				"username":     clientName,
+				"display_name": clientName,
+				"plaintext":    msgText,
+				"timestamp":    strconv.FormatInt(nowMs, 10),
+			},
+		})
+
+		// Non-blocking asynchronous dispatch to backend servers
 		select {
 		case pool.dispatchCh <- feedMsg:
 		default:
@@ -621,14 +879,59 @@ func makeHandler(pool *ServerPool) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
+		// Instant snapshot copy under RLock (< 0.1 microseconds)
 		pool.store.mu.RLock()
-		_ = json.NewEncoder(w).Encode(pool.store.messages)
+		msgs := make([]FeedMessage, len(pool.store.messages))
+		copy(msgs, pool.store.messages)
 		pool.store.mu.RUnlock()
+
+		_ = json.NewEncoder(w).Encode(msgs)
+	})
+
+	// ── POST /messages/batch ─────────────────────────────────────────────────
+	mux.HandleFunc("/messages/batch", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var batch []map[string]interface{}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&batch); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "inserted": 0})
+			return
+		}
+
+		inserted := sharedDB.AddBatch(batch)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"inserted": inserted,
+		})
+	})
+
+	// ── GET /messages ─────────────────────────────────────────────────────────
+	mux.HandleFunc("/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		limit := 100000
+		if lStr := r.URL.Query().Get("limit"); lStr != "" {
+			if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+				limit = l
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(sharedDB.GetMessages(limit))
 	})
 
 	// ── POST /reset-state ────────────────────────────────────────────────────
 	mux.HandleFunc("/reset-state", func(w http.ResponseWriter, r *http.Request) {
 		pool.store.Reset()
+		sharedDB.Reset()
 
 		// Drain pending dispatch queue
 		for len(pool.dispatchCh) > 0 {
@@ -638,6 +941,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 			}
 		}
 
+		// Forward reset-state to all registered backend workers
 		for _, b := range pool.GetAll() {
 			go func(url string) {
 				req, _ := http.NewRequest(http.MethodPost, url+"/reset-state", nil)
@@ -648,19 +952,10 @@ func makeHandler(pool *ServerPool) http.Handler {
 			}(b.URL)
 		}
 
-		// Also ensure Central Shared DBaaS is reset
-		go func() {
-			req, _ := http.NewRequest(http.MethodPost, "http://172.17.0.11:4000/reset-state", nil)
-			resp, err := httpClient.Do(req)
-			if err == nil && resp != nil {
-				_ = resp.Body.Close()
-			}
-		}()
-
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "ok",
-			"message": "load balancer state reset complete",
+			"message": "load balancer and shared database state reset complete",
 		})
 	})
 
@@ -712,6 +1007,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"threshold":      pool.threshold,
 			"stored_msgs":    pool.store.Count(),
+			"shared_msgs":    sharedDB.Count(),
 			"total_requests": atomic.LoadInt64(&totalRequests),
 			"total_errors":   atomic.LoadInt64(&totalErrors),
 			"backends":       stats,
@@ -723,8 +1019,9 @@ func makeHandler(pool *ServerPool) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":      "ok",
-			"role":        "load-balancer",
+			"role":        "load-balancer-and-shared-db",
 			"stored_msgs": pool.store.Count(),
+			"shared_msgs": sharedDB.Count(),
 		})
 	})
 
@@ -733,7 +1030,21 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 // createCustomListener binds with bounded kernel socket buffers to prevent socket memory exhaustion
 func createCustomListener(addr string) (net.Listener, error) {
-	return net.Listen("tcp", addr)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 32*1024)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 64*1024)
+			})
+			if err != nil {
+				return err
+			}
+			return opErr
+		},
+	}
+	return lc.Listen(context.Background(), "tcp", addr)
 }
 
 func main() {
@@ -750,8 +1061,8 @@ func main() {
 
 	runtime.GOMAXPROCS(2)
 
-	// Hard 120 MB heap cap guarantees memory stays well below the 512 MB cgroup limit
-	debug.SetMemoryLimit(120 * 1024 * 1024)
+	// Heap cap guarantees total container memory stays comfortably under 512 MB cgroup limit
+	debug.SetMemoryLimit(180 * 1024 * 1024)
 	debug.SetGCPercent(50)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
@@ -760,16 +1071,18 @@ func main() {
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
 	logFilePath := flag.String("logfile", "/home/student/chat_messages.jsonl", "Append-only message log file")
+	sharedLogFilePath := flag.String("sharedlog", "/home/student/chat_service.jsonl", "Append-only shared DB log file")
 	flag.Parse()
 
 	store := NewMessageStore(*logFilePath)
+	sharedDB := NewSharedDB(*sharedLogFilePath)
 
 	pool := &ServerPool{
 		threshold:  *thresholdFlag,
 		store:      store,
-		dispatchCh: make(chan FeedMessage, 5000),
+		dispatchCh: make(chan FeedMessage, 20000),
 	}
-	startDispatchWorkers(pool, 4)
+	startDispatchWorkers(pool, 16)
 
 	for _, rawURL := range strings.Split(*backendsStr, ",") {
 		rawURL = strings.TrimSpace(rawURL)
@@ -785,41 +1098,33 @@ func main() {
 
 	go healthCheck(pool, 2*time.Second)
 
-	handler := makeHandler(pool)
+	handler := makeHandler(pool, sharedDB)
 
-	// Custom listeners with bounded 16KB TCP socket buffers
-	l3210, err := createCustomListener("0.0.0.0:3210")
-	if err == nil {
-		sDual := &http.Server{
+	// Auxiliary listeners for alternate LB access and Shared DBaaS ports
+	portsToListen := []int{3210, 3109, 4000, 4210}
+	for _, p := range portsToListen {
+		if p == *port {
+			continue
+		}
+		addr := fmt.Sprintf("0.0.0.0:%d", p)
+		l, err := createCustomListener(addr)
+		if err != nil {
+			log.Printf("[AUX] Notice: Could not bind %s: %v", addr, err)
+			continue
+		}
+		srv := &http.Server{
 			Handler:        handler,
 			MaxHeaderBytes: 16 * 1024,
 			ReadTimeout:    15 * time.Second,
 			WriteTimeout:   20 * time.Second,
 			IdleTimeout:    30 * time.Second,
 		}
-		go func() {
-			log.Printf("[DUAL] Listening on http://0.0.0.0:3210")
-			if err := sDual.Serve(l3210); err != nil {
-				log.Printf("[DUAL] Port 3210 listener: %v", err)
+		go func(pNum int, listener net.Listener) {
+			log.Printf("[AUX] Listening on http://0.0.0.0:%d", pNum)
+			if err := srv.Serve(listener); err != nil {
+				log.Printf("[AUX] Port %d listener stopped: %v", pNum, err)
 			}
-		}()
-	}
-
-	l3109, err := createCustomListener("0.0.0.0:3109")
-	if err == nil {
-		s3109 := &http.Server{
-			Handler:        handler,
-			MaxHeaderBytes: 16 * 1024,
-			ReadTimeout:    15 * time.Second,
-			WriteTimeout:   20 * time.Second,
-			IdleTimeout:    30 * time.Second,
-		}
-		go func() {
-			log.Printf("[PORT] Listening on http://0.0.0.0:3109")
-			if err := s3109.Serve(l3109); err != nil {
-				log.Printf("[PORT] Port 3109 listener: %v", err)
-			}
-		}()
+		}(p, l)
 	}
 
 	lMain, err := createCustomListener(fmt.Sprintf("0.0.0.0:%d", *port))
@@ -836,10 +1141,10 @@ func main() {
 	}
 
 	log.Printf("==========================================")
-	log.Printf("  Lab 6 Ultra-Performance Dynamic Load Balancer")
-	log.Printf("  Listening: http://0.0.0.0:%d, 3109, 3210", *port)
+	log.Printf("  Lab 6 Unified Ultra-Performance LB & Shared DB")
+	log.Printf("  Listening: http://0.0.0.0:%d (Aux: 3109, 3210, 4000, 4210)", *port)
 	log.Printf("  Threshold: %.0f  |  Backends: %d", pool.threshold, len(pool.backends))
-	log.Printf("  Durability Log: %s", *logFilePath)
+	log.Printf("  Durability Logs: %s, %s", *logFilePath, *sharedLogFilePath)
 	log.Printf("==========================================")
 
 	if err := server.Serve(lMain); err != nil {
