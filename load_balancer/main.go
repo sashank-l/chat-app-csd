@@ -35,6 +35,10 @@ func newUUID() string {
 	)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FeedMessage & Zero-Leak In-Memory Message Store
+// ─────────────────────────────────────────────────────────────────────────────
+
 type FeedMessage struct {
 	ID         string `json:"id"`
 	ClientName string `json:"client-name"`
@@ -46,9 +50,9 @@ type MessageStore struct {
 	mu       sync.RWMutex
 	messages []FeedMessage
 	seen     map[string]bool
-	fileMu   sync.Mutex
-	logFile  *os.File
 	filePath string
+	logFile  *os.File
+	diskCh   chan FeedMessage
 }
 
 func NewMessageStore(filePath string) *MessageStore {
@@ -56,10 +60,14 @@ func NewMessageStore(filePath string) *MessageStore {
 		messages: make([]FeedMessage, 0, 100000),
 		seen:     make(map[string]bool, 100000),
 		filePath: filePath,
+		diskCh:   make(chan FeedMessage, 100000),
 	}
 
+	// Recover existing messages from disk if available
 	if f, err := os.Open(filePath); err == nil {
 		scanner := bufio.NewScanner(f)
+		buf := make([]byte, 0, 256*1024)
+		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			var msg FeedMessage
 			if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
@@ -84,7 +92,42 @@ func NewMessageStore(filePath string) *MessageStore {
 		ms.logFile = logF
 	}
 
+	// Single dedicated background disk writer worker — NEVER spawns goroutines per request!
+	go ms.diskWriterLoop()
+
 	return ms
+}
+
+func (ms *MessageStore) diskWriterLoop() {
+	var writer *bufio.Writer
+	if ms.logFile != nil {
+		writer = bufio.NewWriterSize(ms.logFile, 128*1024)
+	}
+
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case msg, ok := <-ms.diskCh:
+			if !ok {
+				if writer != nil {
+					writer.Flush()
+				}
+				return
+			}
+			if writer != nil {
+				if data, err := json.Marshal(msg); err == nil {
+					writer.Write(data)
+					writer.WriteByte('\n')
+				}
+			}
+		case <-ticker.C:
+			if writer != nil {
+				writer.Flush()
+			}
+		}
+	}
 }
 
 func (ms *MessageStore) Add(msg FeedMessage) bool {
@@ -101,15 +144,11 @@ func (ms *MessageStore) Add(msg FeedMessage) bool {
 	ms.messages = append(ms.messages, msg)
 	ms.mu.Unlock()
 
-	go func(m FeedMessage) {
-		ms.fileMu.Lock()
-		defer ms.fileMu.Unlock()
-		if ms.logFile != nil {
-			if data, err := json.Marshal(m); err == nil {
-				ms.logFile.Write(append(data, '\n'))
-			}
-		}
-	}(msg)
+	// Non-blocking disk buffer queue
+	select {
+	case ms.diskCh <- msg:
+	default:
+	}
 
 	return true
 }
@@ -134,7 +173,11 @@ func (ms *MessageStore) Reset() {
 	ms.seen = make(map[string]bool, 100000)
 	ms.mu.Unlock()
 
-	ms.fileMu.Lock()
+	// Drain any pending items in disk channel
+	for len(ms.diskCh) > 0 {
+		<-ms.diskCh
+	}
+
 	if ms.logFile != nil {
 		ms.logFile.Close()
 	}
@@ -142,9 +185,12 @@ func (ms *MessageStore) Reset() {
 	if f, err := os.OpenFile(ms.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 		ms.logFile = f
 	}
-	ms.fileMu.Unlock()
 	log.Printf("[STORE] Message store reset complete")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backend & ServerPool
+// ─────────────────────────────────────────────────────────────────────────────
 
 type HealthData struct {
 	Status            string  `json:"status"`
@@ -669,7 +715,7 @@ func main() {
 		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
-	startReplicationWorkers(pool, 32)
+	startReplicationWorkers(pool, 16)
 	go healthCheck(pool, 2*time.Second)
 
 	handler := makeHandler(pool)
