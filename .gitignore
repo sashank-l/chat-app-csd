@@ -1,18 +1,48 @@
+# Virtual environments
 venv/
 .venv/
+
+# Byte-compiled / cache files
 __pycache__/
 *.pyc
+
+# Keys, database files, and secrets
 *.key
 *.db
-SUBMISSION_REPORT.md
-REPORT_TEMPLATE.md
-Report_12341330_Lekkala_Sashank.docx
-scripts/
-*.sh
-generate_docx_report.py
-benchmark/
-cipher-test.py
-key-tampering.py
+
+# Logs and binaries
 *.log
 load_balancer/lb_bin
 load_balancer/go.sum
+load_generator/load_generator
+
+# All Markdown files except README.md
+*.md
+!README.md
+!readme.md
+
+# Reports (.docx, .pdf, templates)
+*.docx
+*.pdf
+Report_*
+REPORT_*
+SUBMISSION_REPORT.md
+REPORT_TEMPLATE.md
+submission_results.json
+
+# Automated deployment, testing, and remote access scripts
+scripts/
+*.sh
+generate_docx_report.py
+generate_lab6_docx.py
+auto_submit*.py
+deploy*.py
+test_*.py
+bench_*.py
+cleanup_*.py
+inspect_*.py
+stress_test*.py
+*remote*.py
+benchmark/
+cipher-test.py
+key-tampering.py
