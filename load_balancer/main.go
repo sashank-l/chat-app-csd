@@ -618,12 +618,12 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		data := pool.store.GetFeedBytes()
-
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
+
+		pool.store.mu.RLock()
+		_ = json.NewEncoder(w).Encode(pool.store.messages)
+		pool.store.mu.RUnlock()
 	})
 
 	// ── POST /reset-state ────────────────────────────────────────────────────

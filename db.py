@@ -339,12 +339,13 @@ def save_messages_batch(batch):
         )
         conn.commit()
 
-    with _seen_lock:
-        for mid in new_seen:
-            _seen_msg_ids.add(mid)
+    if not IS_SHARED_DB_HOST:
+        with _seen_lock:
+            for mid in new_seen:
+                _seen_msg_ids.add(mid)
 
-    with _feed_lock:
-        _memory_feed.extend(feed_items)
+        with _feed_lock:
+            _memory_feed.extend(feed_items)
 
     return len(rows)
 
