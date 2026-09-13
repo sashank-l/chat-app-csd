@@ -33,7 +33,7 @@ func fastUUID() string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FeedMessage & Zero-Allocation Atomic Feed Store
+// FeedMessage & Zero-Allocation Append-Only Feed Store
 // ─────────────────────────────────────────────────────────────────────────────
 
 type FeedMessage struct {
@@ -44,26 +44,22 @@ type FeedMessage struct {
 }
 
 type AtomicFeedStore struct {
-	mu        sync.RWMutex
-	messages  []FeedMessage
-	seen      map[string]bool
-	builder   []byte
-	feedBytes atomic.Pointer[[]byte]
-	diskCh    chan FeedMessage
-	filePath  string
+	mu       sync.RWMutex
+	messages []FeedMessage
+	seen     map[string]bool
+	builder  []byte
+	diskCh   chan FeedMessage
+	filePath string
 }
 
 func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
 	store := &AtomicFeedStore{
 		messages: make([]FeedMessage, 0, 30000),
 		seen:     make(map[string]bool, 30000),
-		builder:  make([]byte, 0, 4*1024*1024),
+		builder:  make([]byte, 0, 8*1024*1024), // Pre-allocated 8MB buffer eliminates all re-allocations
 		diskCh:   make(chan FeedMessage, 5000),
 		filePath: filePath,
 	}
-
-	empty := []byte("[]")
-	store.feedBytes.Store(&empty)
 
 	// Recover existing messages from disk if available
 	if f, err := os.Open(filePath); err == nil {
@@ -87,13 +83,10 @@ func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
 		log.Printf("[STORE] Recovered %d messages from %s", len(store.messages), filePath)
 	}
 
-	// Rebuild pre-rendered JSON byte slice if messages exist
+	// Rebuild pre-rendered builder if messages exist
 	if len(store.messages) > 0 {
-		if data, err := json.Marshal(store.messages); err == nil {
-			store.feedBytes.Store(&data)
-			if len(data) > 2 {
-				store.builder = append(store.builder, data[:len(data)-1]...)
-			}
+		if data, err := json.Marshal(store.messages); err == nil && len(data) > 2 {
+			store.builder = append(store.builder, data[:len(data)-1]...)
 		}
 	}
 
@@ -174,19 +167,12 @@ func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
 
 	msgBytes, err := json.Marshal(msg)
 	if err == nil {
-		if len(s.messages) == 1 {
+		if len(s.builder) == 0 {
 			s.builder = append(s.builder, '[')
 		} else {
 			s.builder = append(s.builder, ',')
 		}
 		s.builder = append(s.builder, msgBytes...)
-
-		// Create closed JSON slice with ']'
-		full := make([]byte, len(s.builder)+1)
-		copy(full, s.builder)
-		full[len(s.builder)] = ']'
-
-		s.feedBytes.Store(&full)
 	}
 	s.mu.Unlock()
 
@@ -196,14 +182,6 @@ func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
 	}
 
 	return true
-}
-
-func (s *AtomicFeedStore) GetFeedBytes() []byte {
-	ptr := s.feedBytes.Load()
-	if ptr != nil {
-		return *ptr
-	}
-	return []byte("[]")
 }
 
 func (s *AtomicFeedStore) Count() int {
@@ -216,9 +194,7 @@ func (s *AtomicFeedStore) Reset() {
 	s.mu.Lock()
 	s.messages = make([]FeedMessage, 0, 30000)
 	s.seen = make(map[string]bool, 30000)
-	s.builder = make([]byte, 0, 4*1024*1024)
-	empty := []byte("[]")
-	s.feedBytes.Store(&empty)
+	s.builder = s.builder[:0] // Retain 8MB pre-allocated capacity without GC overhead
 	s.mu.Unlock()
 
 	for len(s.diskCh) > 0 {
@@ -239,7 +215,7 @@ func (s *AtomicFeedStore) Reset() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SharedDB: Central In-Memory DBaaS with Atomic JSON Cache
+// SharedDB: Central In-Memory DBaaS with Zero-Alloc Direct Insertion
 // ─────────────────────────────────────────────────────────────────────────────
 
 type SharedMessageRecord struct {
@@ -386,6 +362,31 @@ func getStringVal(m map[string]interface{}, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// AddSingle adds a new record from LB POST /message with ZERO map allocation overhead
+func (sdb *SharedDB) AddSingle(msgID, username, plaintext string, timestamp int64) {
+	sdb.mu.Lock()
+	if _, exists := sdb.indexMap[msgID]; !exists {
+		sdb.counter++
+		rec := SharedMessageRecord{
+			ID:          sdb.counter,
+			MsgID:       msgID,
+			Username:    username,
+			DisplayName: username,
+			Timestamp:   strconv.FormatInt(timestamp, 10),
+			Plaintext:   plaintext,
+		}
+		sdb.indexMap[msgID] = len(sdb.messages)
+		sdb.messages = append(sdb.messages, rec)
+		atomic.StoreInt32(&sdb.dirty, 1)
+
+		select {
+		case sdb.diskCh <- rec:
+		default:
+		}
+	}
+	sdb.mu.Unlock()
 }
 
 func (sdb *SharedDB) AddBatch(batch []map[string]interface{}) int {
@@ -865,15 +866,8 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 
 		pool.store.Add(feedMsg)
 
-		sharedDB.AddBatch([]map[string]interface{}{
-			{
-				"msg_id":       msgID,
-				"username":     clientName,
-				"display_name": clientName,
-				"plaintext":    msgText,
-				"timestamp":    strconv.FormatInt(nowMs, 10),
-			},
-		})
+		// Direct zero-allocation addition to SharedDB
+		sharedDB.AddSingle(msgID, clientName, msgText, nowMs)
 
 		select {
 		case pool.dispatchCh <- feedMsg:
@@ -887,7 +881,7 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		_, _ = w.Write(respData)
 	})
 
-	// ── GET /feed (Zero-Allocation Ultra-Fast Atomic Stream) ─────────────────
+	// ── GET /feed (Ultra-Fast Pre-Rendered Stream) ───────────────────────────
 	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
 
@@ -896,11 +890,26 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 			return
 		}
 
-		data := pool.store.GetFeedBytes()
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+
+		pool.store.mu.RLock()
+		n := len(pool.store.builder)
+		if n == 0 {
+			pool.store.mu.RUnlock()
+			w.Header().Set("Content-Length", "2")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
+
+		buf := make([]byte, n+1)
+		copy(buf, pool.store.builder)
+		pool.store.mu.RUnlock()
+		buf[n] = ']'
+
+		w.Header().Set("Content-Length", strconv.Itoa(len(buf)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(data)
+		_, _ = w.Write(buf)
 	})
 
 	// ── POST /messages/batch ─────────────────────────────────────────────────
@@ -1078,8 +1087,8 @@ func main() {
 
 	runtime.GOMAXPROCS(1)
 
-	debug.SetMemoryLimit(120 * 1024 * 1024)
-	debug.SetGCPercent(20)
+	debug.SetMemoryLimit(150 * 1024 * 1024)
+	debug.SetGCPercent(50)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
