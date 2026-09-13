@@ -2,8 +2,7 @@ package main
 
 import (
 	"bufio"
-	"crypto/rand"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"log"
 	"math"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,21 +19,16 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-func newUUID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%s-%s-%s-%s-%s",
-		hex.EncodeToString(b[0:4]),
-		hex.EncodeToString(b[4:6]),
-		hex.EncodeToString(b[6:8]),
-		hex.EncodeToString(b[8:10]),
-		hex.EncodeToString(b[10:]),
-	)
+var uuidCounter uint64
+
+func fastUUID() string {
+	c := atomic.AddUint64(&uuidCounter, 1)
+	now := time.Now().UnixNano()
+	return fmt.Sprintf("%016x-%016x", uint64(now), c)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,16 +52,16 @@ type MessageStore struct {
 
 func NewMessageStore(filePath string) *MessageStore {
 	ms := &MessageStore{
-		messages: make([]FeedMessage, 0, 100000),
-		seen:     make(map[string]bool, 100000),
+		messages: make([]FeedMessage, 0, 50000),
+		seen:     make(map[string]bool, 50000),
 		filePath: filePath,
-		diskCh:   make(chan FeedMessage, 200000),
+		diskCh:   make(chan FeedMessage, 100000),
 	}
 
 	// Recover existing messages from disk if available
 	if f, err := os.Open(filePath); err == nil {
 		scanner := bufio.NewScanner(f)
-		buf := make([]byte, 0, 256*1024)
+		buf := make([]byte, 0, 128*1024)
 		scanner.Buffer(buf, 1024*1024)
 		for scanner.Scan() {
 			var msg FeedMessage
@@ -163,7 +158,6 @@ func (ms *MessageStore) Add(msg FeedMessage) bool {
 	ms.messages = append(ms.messages, msg)
 	ms.mu.Unlock()
 
-	// Asynchronous disk append via channel buffer
 	select {
 	case ms.diskCh <- msg:
 	default:
@@ -188,11 +182,10 @@ func (ms *MessageStore) Count() int {
 
 func (ms *MessageStore) Reset() {
 	ms.mu.Lock()
-	ms.messages = make([]FeedMessage, 0, 100000)
-	ms.seen = make(map[string]bool, 100000)
+	ms.messages = make([]FeedMessage, 0, 50000)
+	ms.seen = make(map[string]bool, 50000)
 	ms.mu.Unlock()
 
-	// Drain any pending items in diskCh
 	for len(ms.diskCh) > 0 {
 		select {
 		case <-ms.diskCh:
@@ -391,7 +384,6 @@ type ReplicationTask struct {
 
 var replicationCh = make(chan ReplicationTask, 100000)
 
-// Background replication workers distribute copies to external nodes (Sys3 and Sys4)
 func startReplicationWorkers(pool *ServerPool) {
 	for i := 0; i < 4; i++ {
 		go func() {
@@ -488,58 +480,54 @@ func makeHandler(pool *ServerPool) http.Handler {
 			return
 		}
 
-		// Limit reader to 32KB to prevent memory exhaustion
-		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
-		if err != nil {
-			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
-			return
-		}
-
 		var clientName, msgText, msgID string
 
-		// 1. Static struct decode (no map allocation)
+		// Fast streaming JSON decoder bounded by 32KB
 		var req MsgRequest
-		if err := json.Unmarshal(bodyBytes, &req); err == nil {
-			clientName = req.ClientName
-			if clientName == "" {
-				clientName = req.ClientNameAlt
-			}
-			if clientName == "" {
-				clientName = req.Username
-			}
-			msgText = req.Msg
-			if msgText == "" {
-				msgText = req.Text
-			}
-			msgID = req.MsgID
-			if msgID == "" {
-				msgID = req.ID
-			}
-		}
-
-		// 2. Fallback to Form URL-encoded
-		if clientName == "" || msgText == "" {
-			vals, err := url.ParseQuery(string(bodyBytes))
-			if err == nil && len(vals) > 0 {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
+		if err == nil && len(bodyBytes) > 0 {
+			if json.Unmarshal(bodyBytes, &req) == nil {
+				clientName = req.ClientName
 				if clientName == "" {
-					clientName = vals.Get("client-name")
-					if clientName == "" {
-						clientName = vals.Get("client_name")
-					}
-					if clientName == "" {
-						clientName = vals.Get("username")
-					}
+					clientName = req.ClientNameAlt
 				}
+				if clientName == "" {
+					clientName = req.Username
+				}
+				msgText = req.Msg
 				if msgText == "" {
-					msgText = vals.Get("msg")
-					if msgText == "" {
-						msgText = vals.Get("text")
-					}
+					msgText = req.Text
 				}
+				msgID = req.MsgID
 				if msgID == "" {
-					msgID = vals.Get("msg_id")
+					msgID = req.ID
+				}
+			}
+
+			// Fallback to Form URL-encoded if JSON was not matched
+			if clientName == "" || msgText == "" {
+				vals, err := url.ParseQuery(string(bodyBytes))
+				if err == nil && len(vals) > 0 {
+					if clientName == "" {
+						clientName = vals.Get("client-name")
+						if clientName == "" {
+							clientName = vals.Get("client_name")
+						}
+						if clientName == "" {
+							clientName = vals.Get("username")
+						}
+					}
+					if msgText == "" {
+						msgText = vals.Get("msg")
+						if msgText == "" {
+							msgText = vals.Get("text")
+						}
+					}
 					if msgID == "" {
-						msgID = vals.Get("id")
+						msgID = vals.Get("msg_id")
+						if msgID == "" {
+							msgID = vals.Get("id")
+						}
 					}
 				}
 			}
@@ -555,7 +543,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 		}
 
 		if msgID == "" {
-			msgID = newUUID()
+			msgID = fastUUID()
 		}
 
 		nowMs := time.Now().UnixMilli()
@@ -575,8 +563,6 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-
-		// Fast response write with zero map allocation
 		fmt.Fprintf(w, `{"status":"ok","msg_id":"%s","client-name":"%s","timestamp":%d}`, msgID, clientName, nowMs)
 	})
 
@@ -591,7 +577,6 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		allMsgs := pool.store.GetAll()
 
-		// Chronological ascending sort
 		sort.Slice(allMsgs, func(i, j int) bool {
 			return allMsgs[i].Timestamp < allMsgs[j].Timestamp
 		})
@@ -669,10 +654,23 @@ func makeHandler(pool *ServerPool) http.Handler {
 	return mux
 }
 
+// createCustomListener binds with bounded kernel socket buffers to prevent socket memory exhaustion
+func createCustomListener(addr string) (net.Listener, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024)
+			})
+		},
+	}
+	return lc.Listen(context.Background(), "tcp", addr)
+}
+
 func main() {
-	// Strictly enforce 128 MB heap cap and aggressive GC to guarantee zero cgroup OOM kills
-	debug.SetMemoryLimit(128 * 1024 * 1024)
-	debug.SetGCPercent(20)
+	// 250 MB heap cap ensures maximum headroom within 512 MB cgroup without GC thrashing
+	debug.SetMemoryLimit(250 * 1024 * 1024)
+	debug.SetGCPercent(100)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
@@ -706,38 +704,47 @@ func main() {
 
 	handler := makeHandler(pool)
 
-	go func() {
+	// Custom listeners with bounded 16KB TCP socket buffers
+	l3210, err := createCustomListener("0.0.0.0:3210")
+	if err == nil {
 		sDual := &http.Server{
-			Addr:           "0.0.0.0:3210",
 			Handler:        handler,
 			MaxHeaderBytes: 16 * 1024,
 			ReadTimeout:    15 * time.Second,
 			WriteTimeout:   20 * time.Second,
 			IdleTimeout:    30 * time.Second,
 		}
-		log.Printf("[DUAL] Also listening on http://0.0.0.0:3210")
-		if err := sDual.ListenAndServe(); err != nil {
-			log.Printf("[DUAL] Port 3210 listener: %v", err)
-		}
-	}()
+		go func() {
+			log.Printf("[DUAL] Listening on http://0.0.0.0:3210")
+			if err := sDual.Serve(l3210); err != nil {
+				log.Printf("[DUAL] Port 3210 listener: %v", err)
+			}
+		}()
+	}
 
-	go func() {
+	l3109, err := createCustomListener("0.0.0.0:3109")
+	if err == nil {
 		s3109 := &http.Server{
-			Addr:           "0.0.0.0:3109",
 			Handler:        handler,
 			MaxHeaderBytes: 16 * 1024,
 			ReadTimeout:    15 * time.Second,
 			WriteTimeout:   20 * time.Second,
 			IdleTimeout:    30 * time.Second,
 		}
-		log.Printf("[PORT] Also listening on http://0.0.0.0:3109")
-		if err := s3109.ListenAndServe(); err != nil {
-			log.Printf("[PORT] Port 3109 listener: %v", err)
-		}
-	}()
+		go func() {
+			log.Printf("[PORT] Listening on http://0.0.0.0:3109")
+			if err := s3109.Serve(l3109); err != nil {
+				log.Printf("[PORT] Port 3109 listener: %v", err)
+			}
+		}()
+	}
+
+	lMain, err := createCustomListener(fmt.Sprintf("0.0.0.0:%d", *port))
+	if err != nil {
+		log.Fatalf("Failed to bind port %d: %v", *port, err)
+	}
 
 	server := &http.Server{
-		Addr:           fmt.Sprintf("0.0.0.0:%d", *port),
 		Handler:        handler,
 		MaxHeaderBytes: 16 * 1024,
 		ReadTimeout:    15 * time.Second,
@@ -752,7 +759,7 @@ func main() {
 	log.Printf("  Durability Log: %s", *logFilePath)
 	log.Printf("==========================================")
 
-	if err := server.ListenAndServe(); err != nil {
+	if err := server.Serve(lMain); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }
