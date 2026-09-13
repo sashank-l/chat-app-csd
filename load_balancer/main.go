@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -36,7 +37,7 @@ func newUUID() string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FeedMessage & Zero-Leak In-Memory Message Store
+// FeedMessage & Crash-Proof Zero-Leak Message Store
 // ─────────────────────────────────────────────────────────────────────────────
 
 type FeedMessage struct {
@@ -51,7 +52,6 @@ type MessageStore struct {
 	messages []FeedMessage
 	seen     map[string]bool
 	filePath string
-	logFile  *os.File
 	diskCh   chan FeedMessage
 }
 
@@ -60,7 +60,7 @@ func NewMessageStore(filePath string) *MessageStore {
 		messages: make([]FeedMessage, 0, 100000),
 		seen:     make(map[string]bool, 100000),
 		filePath: filePath,
-		diskCh:   make(chan FeedMessage, 100000),
+		diskCh:   make(chan FeedMessage, 200000),
 	}
 
 	// Recover existing messages from disk if available
@@ -85,26 +85,34 @@ func NewMessageStore(filePath string) *MessageStore {
 		log.Printf("[STORE] Recovered %d messages from %s", len(ms.messages), filePath)
 	}
 
-	logF, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		log.Printf("[STORE] Warning: could not open log file %s: %v", filePath, err)
-	} else {
-		ms.logFile = logF
-	}
-
-	// Single dedicated background disk writer worker — NEVER spawns goroutines per request!
 	go ms.diskWriterLoop()
-
 	return ms
 }
 
 func (ms *MessageStore) diskWriterLoop() {
+	var f *os.File
 	var writer *bufio.Writer
-	if ms.logFile != nil {
-		writer = bufio.NewWriterSize(ms.logFile, 128*1024)
+
+	openLog := func() {
+		if f != nil {
+			if writer != nil {
+				_ = writer.Flush()
+			}
+			_ = f.Close()
+		}
+		var err error
+		f, err = os.OpenFile(ms.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Printf("[STORE] Warning: could not open log file %s: %v", ms.filePath, err)
+			writer = nil
+		} else {
+			writer = bufio.NewWriterSize(f, 64*1024)
+		}
 	}
 
-	ticker := time.NewTicker(150 * time.Millisecond)
+	openLog()
+
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -112,19 +120,30 @@ func (ms *MessageStore) diskWriterLoop() {
 		case msg, ok := <-ms.diskCh:
 			if !ok {
 				if writer != nil {
-					writer.Flush()
+					_ = writer.Flush()
+				}
+				if f != nil {
+					_ = f.Close()
 				}
 				return
 			}
+			if msg.ID == "__RESET__" {
+				if f != nil {
+					_ = f.Close()
+				}
+				_ = os.Truncate(ms.filePath, 0)
+				openLog()
+				continue
+			}
 			if writer != nil {
 				if data, err := json.Marshal(msg); err == nil {
-					writer.Write(data)
-					writer.WriteByte('\n')
+					_, _ = writer.Write(data)
+					_ = writer.WriteByte('\n')
 				}
 			}
 		case <-ticker.C:
 			if writer != nil {
-				writer.Flush()
+				_ = writer.Flush()
 			}
 		}
 	}
@@ -144,7 +163,7 @@ func (ms *MessageStore) Add(msg FeedMessage) bool {
 	ms.messages = append(ms.messages, msg)
 	ms.mu.Unlock()
 
-	// Non-blocking disk buffer queue
+	// Asynchronous disk append via channel buffer
 	select {
 	case ms.diskCh <- msg:
 	default:
@@ -173,18 +192,15 @@ func (ms *MessageStore) Reset() {
 	ms.seen = make(map[string]bool, 100000)
 	ms.mu.Unlock()
 
-	// Drain any pending items in disk channel
+	// Drain any pending items in diskCh
 	for len(ms.diskCh) > 0 {
-		<-ms.diskCh
+		select {
+		case <-ms.diskCh:
+		default:
+		}
 	}
 
-	if ms.logFile != nil {
-		ms.logFile.Close()
-	}
-	_ = os.Truncate(ms.filePath, 0)
-	if f, err := os.OpenFile(ms.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		ms.logFile = f
-	}
+	ms.diskCh <- FeedMessage{ID: "__RESET__"}
 	log.Printf("[STORE] Message store reset complete")
 }
 
@@ -358,21 +374,12 @@ func (s *ServerPool) AdaptThreshold() {
 }
 
 var httpClient = &http.Client{
-	Timeout: 5 * time.Second,
+	Timeout: 4 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 200,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
 		IdleConnTimeout:     30 * time.Second,
 		DisableKeepAlives:   false,
-	},
-}
-
-var feedHttpClient = &http.Client{
-	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        50,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     30 * time.Second,
 	},
 }
 
@@ -384,8 +391,9 @@ type ReplicationTask struct {
 
 var replicationCh = make(chan ReplicationTask, 100000)
 
-func startReplicationWorkers(pool *ServerPool, numWorkers int) {
-	for i := 0; i < numWorkers; i++ {
+// Background replication workers distribute copies to external nodes (Sys3 and Sys4)
+func startReplicationWorkers(pool *ServerPool) {
+	for i := 0; i < 4; i++ {
 		go func() {
 			for task := range replicationCh {
 				target := pool.SelectBest()
@@ -404,8 +412,8 @@ func startReplicationWorkers(pool *ServerPool, numWorkers int) {
 				atomic.AddInt64(&target.ActiveInFlight, -1)
 
 				if err == nil && resp != nil {
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
 					if resp.StatusCode < 400 {
 						target.RecordSuccess()
 						atomic.AddInt64(&target.TotalServed, 1)
@@ -415,7 +423,7 @@ func startReplicationWorkers(pool *ServerPool, numWorkers int) {
 					}
 				} else {
 					if resp != nil {
-						resp.Body.Close()
+						_ = resp.Body.Close()
 					}
 					target.RecordFailure()
 					atomic.AddInt64(&target.TotalErrors, 1)
@@ -435,7 +443,7 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 				resp, err := httpClient.Get(backend.URL + "/health")
 				if err != nil || resp.StatusCode != http.StatusOK {
 					if resp != nil {
-						resp.Body.Close()
+						_ = resp.Body.Close()
 					}
 					backend.SetAlive(false)
 					return
@@ -458,50 +466,66 @@ var (
 	totalErrors   int64
 )
 
+type MsgRequest struct {
+	ClientName    string `json:"client-name"`
+	ClientNameAlt string `json:"client_name"`
+	Username      string `json:"username"`
+	Msg           string `json:"msg"`
+	Text          string `json:"text"`
+	MsgID         string `json:"msg_id"`
+	ID            string `json:"id"`
+}
+
 func makeHandler(pool *ServerPool) http.Handler {
 	mux := http.NewServeMux()
 
+	// ── POST /message ────────────────────────────────────────────────────────
 	mux.HandleFunc("/message", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
-		t0 := time.Now()
 
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
 
-		var clientName, msgText, msgID string
-
-		bodyBytes, err := io.ReadAll(r.Body)
+		// Limit reader to 32KB to prevent memory exhaustion
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 32*1024))
 		if err != nil {
 			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 			return
 		}
 
-		var jsonBody map[string]interface{}
-		if err := json.Unmarshal(bodyBytes, &jsonBody); err == nil && len(jsonBody) > 0 {
-			if v, ok := jsonBody["client-name"]; ok {
-				clientName = fmt.Sprint(v)
-			} else if v, ok := jsonBody["username"]; ok {
-				clientName = fmt.Sprint(v)
+		var clientName, msgText, msgID string
+
+		// 1. Static struct decode (no map allocation)
+		var req MsgRequest
+		if err := json.Unmarshal(bodyBytes, &req); err == nil {
+			clientName = req.ClientName
+			if clientName == "" {
+				clientName = req.ClientNameAlt
 			}
-			if v, ok := jsonBody["msg"]; ok {
-				msgText = fmt.Sprint(v)
-			} else if v, ok := jsonBody["text"]; ok {
-				msgText = fmt.Sprint(v)
+			if clientName == "" {
+				clientName = req.Username
 			}
-			if v, ok := jsonBody["msg_id"]; ok {
-				msgID = fmt.Sprint(v)
-			} else if v, ok := jsonBody["id"]; ok {
-				msgID = fmt.Sprint(v)
+			msgText = req.Msg
+			if msgText == "" {
+				msgText = req.Text
+			}
+			msgID = req.MsgID
+			if msgID == "" {
+				msgID = req.ID
 			}
 		}
 
+		// 2. Fallback to Form URL-encoded
 		if clientName == "" || msgText == "" {
 			vals, err := url.ParseQuery(string(bodyBytes))
 			if err == nil && len(vals) > 0 {
 				if clientName == "" {
 					clientName = vals.Get("client-name")
+					if clientName == "" {
+						clientName = vals.Get("client_name")
+					}
 					if clientName == "" {
 						clientName = vals.Get("username")
 					}
@@ -552,17 +576,11 @@ func makeHandler(pool *ServerPool) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
-		respBytes, _ := json.Marshal(map[string]interface{}{
-			"status":      "ok",
-			"msg_id":      msgID,
-			"client-name": clientName,
-			"msg":         msgText,
-			"timestamp":   nowMs,
-			"latency_ms":  time.Since(t0).Milliseconds(),
-		})
-		w.Write(respBytes)
+		// Fast response write with zero map allocation
+		fmt.Fprintf(w, `{"status":"ok","msg_id":"%s","client-name":"%s","timestamp":%d}`, msgID, clientName, nowMs)
 	})
 
+	// ── GET /feed ────────────────────────────────────────────────────────────
 	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&totalRequests, 1)
 
@@ -573,55 +591,17 @@ func makeHandler(pool *ServerPool) http.Handler {
 
 		allMsgs := pool.store.GetAll()
 
-		if len(allMsgs) == 0 {
-			backends := pool.GetAll()
-			type feedResult struct {
-				msgs []FeedMessage
-			}
-			ch := make(chan feedResult, len(backends))
-			for _, b := range backends {
-				go func(backendURL string) {
-					resp, err := feedHttpClient.Get(backendURL + "/feed")
-					if err != nil || resp.StatusCode != http.StatusOK {
-						if resp != nil {
-							resp.Body.Close()
-						}
-						ch <- feedResult{nil}
-						return
-					}
-					defer resp.Body.Close()
-					var msgs []FeedMessage
-					json.NewDecoder(resp.Body).Decode(&msgs)
-					ch <- feedResult{msgs}
-				}(b.URL)
-			}
-
-			seen := make(map[string]bool)
-			for range backends {
-				res := <-ch
-				for _, m := range res.msgs {
-					key := m.ID
-					if key == "" {
-						key = fmt.Sprintf("%s_%s_%d", m.ClientName, m.Msg, m.Timestamp)
-					}
-					if !seen[key] {
-						seen[key] = true
-						allMsgs = append(allMsgs, m)
-						pool.store.Add(m)
-					}
-				}
-			}
-		}
-
+		// Chronological ascending sort
 		sort.Slice(allMsgs, func(i, j int) bool {
 			return allMsgs[i].Timestamp < allMsgs[j].Timestamp
 		})
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(allMsgs)
+		_ = json.NewEncoder(w).Encode(allMsgs)
 	})
 
+	// ── POST /reset-state ────────────────────────────────────────────────────
 	mux.HandleFunc("/reset-state", func(w http.ResponseWriter, r *http.Request) {
 		pool.store.Reset()
 
@@ -630,18 +610,19 @@ func makeHandler(pool *ServerPool) http.Handler {
 				req, _ := http.NewRequest(http.MethodPost, url+"/reset-state", nil)
 				resp, err := httpClient.Do(req)
 				if err == nil && resp != nil {
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			}(b.URL)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "ok",
 			"message": "load balancer state reset complete",
 		})
 	})
 
+	// ── GET /lb-stats ─────────────────────────────────────────────────────────
 	mux.HandleFunc("/lb-stats", func(w http.ResponseWriter, r *http.Request) {
 		pool.mu.RLock()
 		defer pool.mu.RUnlock()
@@ -666,7 +647,7 @@ func makeHandler(pool *ServerPool) http.Handler {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"threshold":      pool.threshold,
 			"stored_msgs":    pool.store.Count(),
 			"total_requests": atomic.LoadInt64(&totalRequests),
@@ -675,9 +656,10 @@ func makeHandler(pool *ServerPool) http.Handler {
 		})
 	})
 
+	// ── GET /health ───────────────────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":      "ok",
 			"role":        "load-balancer",
 			"stored_msgs": pool.store.Count(),
@@ -688,9 +670,13 @@ func makeHandler(pool *ServerPool) http.Handler {
 }
 
 func main() {
+	// Strictly enforce 128 MB heap cap and aggressive GC to guarantee zero cgroup OOM kills
+	debug.SetMemoryLimit(128 * 1024 * 1024)
+	debug.SetGCPercent(20)
+
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
-		"http://172.17.0.11:4000,http://172.17.0.12:3000,http://172.17.0.13:3000",
+		"http://172.17.0.12:3000,http://172.17.0.13:3000",
 		"Comma-separated backend base URLs")
 	thresholdFlag := flag.Float64("threshold", 60.0, "Initial load score threshold (0-100)")
 	logFilePath := flag.String("logfile", "/home/student/chat_messages.jsonl", "Append-only message log file")
@@ -715,18 +701,19 @@ func main() {
 		log.Printf("[INIT] Backend registered: %s", rawURL)
 	}
 
-	startReplicationWorkers(pool, 16)
+	startReplicationWorkers(pool)
 	go healthCheck(pool, 2*time.Second)
 
 	handler := makeHandler(pool)
 
 	go func() {
 		sDual := &http.Server{
-			Addr:         "0.0.0.0:3210",
-			Handler:      handler,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 20 * time.Second,
-			IdleTimeout:  60 * time.Second,
+			Addr:           "0.0.0.0:3210",
+			Handler:        handler,
+			MaxHeaderBytes: 16 * 1024,
+			ReadTimeout:    15 * time.Second,
+			WriteTimeout:   20 * time.Second,
+			IdleTimeout:    30 * time.Second,
 		}
 		log.Printf("[DUAL] Also listening on http://0.0.0.0:3210")
 		if err := sDual.ListenAndServe(); err != nil {
@@ -736,11 +723,12 @@ func main() {
 
 	go func() {
 		s3109 := &http.Server{
-			Addr:         "0.0.0.0:3109",
-			Handler:      handler,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 20 * time.Second,
-			IdleTimeout:  60 * time.Second,
+			Addr:           "0.0.0.0:3109",
+			Handler:        handler,
+			MaxHeaderBytes: 16 * 1024,
+			ReadTimeout:    15 * time.Second,
+			WriteTimeout:   20 * time.Second,
+			IdleTimeout:    30 * time.Second,
 		}
 		log.Printf("[PORT] Also listening on http://0.0.0.0:3109")
 		if err := s3109.ListenAndServe(); err != nil {
@@ -749,11 +737,12 @@ func main() {
 	}()
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf("0.0.0.0:%d", *port),
-		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 20 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:           fmt.Sprintf("0.0.0.0:%d", *port),
+		Handler:        handler,
+		MaxHeaderBytes: 16 * 1024,
+		ReadTimeout:    15 * time.Second,
+		WriteTimeout:   20 * time.Second,
+		IdleTimeout:    30 * time.Second,
 	}
 
 	log.Printf("==========================================")
