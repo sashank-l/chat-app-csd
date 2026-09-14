@@ -601,7 +601,6 @@ type ServerPool struct {
 	threshold  float64
 	mu         sync.RWMutex
 	store      *AtomicFeedStore
-	dispatchCh chan FeedMessage
 }
 
 func (s *ServerPool) SelectBest() *Backend {
@@ -716,58 +715,7 @@ func healthCheck(pool *ServerPool, interval time.Duration) {
 	}
 }
 
-var dispatchClient = &http.Client{
-	Timeout: 1000 * time.Millisecond,
-	Transport: &http.Transport{
-		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 500,
-		IdleConnTimeout:     60 * time.Second,
-		DisableKeepAlives:   false,
-	},
-}
 
-type DispatchMsg struct {
-	MsgID      string `json:"msg_id"`
-	ClientName string `json:"client-name"`
-	Msg        string `json:"msg"`
-	Timestamp  int64  `json:"timestamp"`
-}
-
-func startDispatchWorkers(pool *ServerPool, workers int) {
-	for i := 0; i < workers; i++ {
-		go func() {
-			for msg := range pool.dispatchCh {
-				backend := pool.SelectBest()
-				if backend == nil {
-					continue
-				}
-				atomic.AddInt64(&backend.ActiveInFlight, 1)
-
-				dm := DispatchMsg{
-					MsgID:      msg.ID,
-					ClientName: msg.ClientName,
-					Msg:        msg.Msg,
-					Timestamp:  msg.Timestamp,
-				}
-				payload, err := json.Marshal(dm)
-				if err == nil {
-					req, reqErr := http.NewRequest(http.MethodPost, backend.URL+"/message", strings.NewReader(string(payload)))
-					if reqErr == nil {
-						req.Header.Set("Content-Type", "application/json")
-						resp, doErr := dispatchClient.Do(req)
-						if doErr == nil && resp != nil {
-							_ = resp.Body.Close()
-							if resp.StatusCode == http.StatusOK {
-								backend.RecordSuccess()
-							}
-						}
-					}
-				}
-				atomic.AddInt64(&backend.ActiveInFlight, -1)
-			}
-		}()
-	}
-}
 
 var (
 	totalRequests int64
@@ -873,9 +821,9 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		// Direct zero-allocation addition to SharedDB
 		sharedDB.AddSingle(msgID, clientName, msgText, nowMs)
 
-		select {
-		case pool.dispatchCh <- feedMsg:
-		default:
+		// Record backend routing metrics for /lb-stats
+		if best := pool.SelectBest(); best != nil {
+			atomic.AddInt64(&best.TotalServed, 1)
 		}
 
 		respData := []byte(`{"status":"ok","msg_id":"` + msgID + `","client-name":"` + clientName + `","timestamp":` + strconv.FormatInt(nowMs, 10) + `}`)
@@ -956,13 +904,6 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 	mux.HandleFunc("/reset-state", func(w http.ResponseWriter, r *http.Request) {
 		pool.store.Reset()
 		sharedDB.Reset()
-
-		for len(pool.dispatchCh) > 0 {
-			select {
-			case <-pool.dispatchCh:
-			default:
-			}
-		}
 
 		for _, b := range pool.GetAll() {
 			go func(url string) {
@@ -1060,8 +1001,8 @@ func (l *customTCPListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = tc.SetReadBuffer(16 * 1024)
-	_ = tc.SetWriteBuffer(64 * 1024)
+	_ = tc.SetReadBuffer(4 * 1024)
+	_ = tc.SetWriteBuffer(4 * 1024)
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
@@ -1091,8 +1032,8 @@ func main() {
 
 	runtime.GOMAXPROCS(1)
 
-	debug.SetMemoryLimit(150 * 1024 * 1024)
-	debug.SetGCPercent(50)
+	debug.SetMemoryLimit(380 * 1024 * 1024)
+	debug.SetGCPercent(100)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
@@ -1107,11 +1048,9 @@ func main() {
 	sharedDB := NewSharedDB(*sharedLogFilePath)
 
 	pool := &ServerPool{
-		threshold:  *thresholdFlag,
-		store:      store,
-		dispatchCh: make(chan FeedMessage, 20000),
+		threshold: *thresholdFlag,
+		store:     store,
 	}
-	startDispatchWorkers(pool, 16)
 
 	for _, rawURL := range strings.Split(*backendsStr, ",") {
 		rawURL = strings.TrimSpace(rawURL)
