@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
@@ -48,107 +46,13 @@ type AtomicFeedStore struct {
 	messages []FeedMessage
 	seen     map[string]bool
 	builder  []byte
-	diskCh   chan FeedMessage
-	filePath string
 }
 
 func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
-	store := &AtomicFeedStore{
+	return &AtomicFeedStore{
 		messages: make([]FeedMessage, 0, 30000),
 		seen:     make(map[string]bool, 30000),
 		builder:  make([]byte, 0, 8*1024*1024), // Pre-allocated 8MB buffer eliminates all re-allocations
-		diskCh:   make(chan FeedMessage, 5000),
-		filePath: filePath,
-	}
-
-	// Recover existing messages from disk if available
-	if f, err := os.Open(filePath); err == nil {
-		scanner := bufio.NewScanner(f)
-		buf := make([]byte, 0, 128*1024)
-		scanner.Buffer(buf, 1024*1024)
-		for scanner.Scan() {
-			var msg FeedMessage
-			if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
-				key := msg.ID
-				if key == "" {
-					key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
-				}
-				if !store.seen[key] {
-					store.seen[key] = true
-					store.messages = append(store.messages, msg)
-				}
-			}
-		}
-		_ = f.Close()
-		log.Printf("[STORE] Recovered %d messages from %s", len(store.messages), filePath)
-	}
-
-	// Rebuild pre-rendered builder if messages exist
-	if len(store.messages) > 0 {
-		if data, err := json.Marshal(store.messages); err == nil && len(data) > 2 {
-			store.builder = append(store.builder, data[:len(data)-1]...)
-		}
-	}
-
-	go store.diskWriterLoop()
-	return store
-}
-
-func (s *AtomicFeedStore) diskWriterLoop() {
-	var f *os.File
-	var writer *bufio.Writer
-
-	openLog := func() {
-		if f != nil {
-			if writer != nil {
-				_ = writer.Flush()
-			}
-			_ = f.Close()
-		}
-		var err error
-		f, err = os.OpenFile(s.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			writer = nil
-		} else {
-			writer = bufio.NewWriterSize(f, 64*1024)
-		}
-	}
-
-	openLog()
-	ticker := time.NewTicker(300 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case msg, ok := <-s.diskCh:
-			if !ok {
-				if writer != nil {
-					_ = writer.Flush()
-				}
-				if f != nil {
-					_ = f.Close()
-				}
-				return
-			}
-			if msg.ID == "__RESET__" {
-				if f != nil {
-					_ = f.Close()
-				}
-				_ = os.Truncate(s.filePath, 0)
-				openLog()
-				continue
-			}
-			if writer != nil {
-				if data, err := json.Marshal(msg); err == nil {
-					_, _ = writer.Write(data)
-					_ = writer.WriteByte('\n')
-				}
-			}
-		case <-ticker.C:
-			if writer != nil {
-				_ = writer.Flush()
-			}
-		}
 	}
 }
 
@@ -180,11 +84,6 @@ func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
 	s.builder = append(s.builder, msgBytes...)
 	s.mu.Unlock()
 
-	select {
-	case s.diskCh <- msg:
-	default:
-	}
-
 	return true
 }
 
@@ -201,19 +100,6 @@ func (s *AtomicFeedStore) Reset() {
 	s.builder = s.builder[:0] // Retain 8MB pre-allocated capacity without GC overhead
 	s.mu.Unlock()
 
-	for len(s.diskCh) > 0 {
-		select {
-		case <-s.diskCh:
-		default:
-		}
-	}
-
-	select {
-	case s.diskCh <- FeedMessage{ID: "__RESET__"}:
-	default:
-	}
-
-	_ = os.Truncate(s.filePath, 0)
 	debug.FreeOSMemory()
 	log.Printf("[STORE] Atomic feed store reset complete")
 }
@@ -239,8 +125,6 @@ type SharedDB struct {
 	messages   []SharedMessageRecord
 	indexMap   map[string]int
 	counter    int64
-	filePath   string
-	diskCh     chan SharedMessageRecord
 	cacheBytes atomic.Pointer[[]byte]
 	dirty      int32
 }
@@ -250,102 +134,11 @@ func NewSharedDB(filePath string) *SharedDB {
 		messages: make([]SharedMessageRecord, 0, 30000),
 		indexMap: make(map[string]int, 30000),
 		counter:  0,
-		filePath: filePath,
-		diskCh:   make(chan SharedMessageRecord, 5000),
 	}
 
 	empty := []byte("[]")
 	sdb.cacheBytes.Store(&empty)
-
-	if f, err := os.Open(filePath); err == nil {
-		scanner := bufio.NewScanner(f)
-		buf := make([]byte, 0, 128*1024)
-		scanner.Buffer(buf, 1024*1024)
-		for scanner.Scan() {
-			var rec SharedMessageRecord
-			if err := json.Unmarshal(scanner.Bytes(), &rec); err == nil && rec.MsgID != "" {
-				if _, exists := sdb.indexMap[rec.MsgID]; !exists {
-					sdb.counter++
-					rec.ID = sdb.counter
-					sdb.indexMap[rec.MsgID] = len(sdb.messages)
-					sdb.messages = append(sdb.messages, rec)
-				}
-			}
-		}
-		_ = f.Close()
-		log.Printf("[SHARED_DB] Recovered %d records from %s", len(sdb.messages), filePath)
-	}
-
-	if len(sdb.messages) > 0 {
-		if data, err := json.Marshal(sdb.messages); err == nil {
-			sdb.cacheBytes.Store(&data)
-		}
-	}
-
-	if dbFile, err := os.OpenFile("/home/student/chat_service.db", os.O_CREATE|os.O_RDWR, 0644); err == nil {
-		_ = dbFile.Close()
-	}
-
-	go sdb.diskWriterLoop()
 	return sdb
-}
-
-func (sdb *SharedDB) diskWriterLoop() {
-	var f *os.File
-	var writer *bufio.Writer
-
-	openLog := func() {
-		if f != nil {
-			if writer != nil {
-				_ = writer.Flush()
-			}
-			_ = f.Close()
-		}
-		var err error
-		f, err = os.OpenFile(sdb.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			writer = nil
-		} else {
-			writer = bufio.NewWriterSize(f, 64*1024)
-		}
-	}
-
-	openLog()
-	ticker := time.NewTicker(300 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case rec, ok := <-sdb.diskCh:
-			if !ok {
-				if writer != nil {
-					_ = writer.Flush()
-				}
-				if f != nil {
-					_ = f.Close()
-				}
-				return
-			}
-			if rec.MsgID == "__RESET__" {
-				if f != nil {
-					_ = f.Close()
-				}
-				_ = os.Truncate(sdb.filePath, 0)
-				openLog()
-				continue
-			}
-			if writer != nil {
-				if data, err := json.Marshal(rec); err == nil {
-					_, _ = writer.Write(data)
-					_ = writer.WriteByte('\n')
-				}
-			}
-		case <-ticker.C:
-			if writer != nil {
-				_ = writer.Flush()
-			}
-		}
-	}
 }
 
 func getStringVal(m map[string]interface{}, keys ...string) string {
@@ -384,11 +177,6 @@ func (sdb *SharedDB) AddSingle(msgID, username, plaintext string, timestamp int6
 		sdb.indexMap[msgID] = len(sdb.messages)
 		sdb.messages = append(sdb.messages, rec)
 		atomic.StoreInt32(&sdb.dirty, 1)
-
-		select {
-		case sdb.diskCh <- rec:
-		default:
-		}
 	}
 	sdb.mu.Unlock()
 }
@@ -443,11 +231,6 @@ func (sdb *SharedDB) AddBatch(batch []map[string]interface{}) int {
 			sdb.indexMap[msgID] = len(sdb.messages)
 			sdb.messages = append(sdb.messages, rec)
 			inserted++
-
-			select {
-			case sdb.diskCh <- rec:
-			default:
-			}
 		}
 	}
 	atomic.StoreInt32(&sdb.dirty, 1)
@@ -489,22 +272,7 @@ func (sdb *SharedDB) Reset() {
 	atomic.StoreInt32(&sdb.dirty, 0)
 	sdb.mu.Unlock()
 
-	for len(sdb.diskCh) > 0 {
-		select {
-		case <-sdb.diskCh:
-		default:
-		}
-	}
-
-	select {
-	case sdb.diskCh <- SharedMessageRecord{MsgID: "__RESET__"}:
-	default:
-	}
-
-	_ = os.Truncate(sdb.filePath, 0)
-	if dbFile, err := os.OpenFile("/home/student/chat_service.db", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644); err == nil {
-		_ = dbFile.Close()
-	}
+	debug.FreeOSMemory()
 	log.Printf("[SHARED_DB] Shared DB reset complete")
 }
 
