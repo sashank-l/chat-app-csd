@@ -153,11 +153,18 @@ func (s *AtomicFeedStore) diskWriterLoop() {
 }
 
 func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
-	s.mu.Lock()
 	key := msg.ID
 	if key == "" {
 		key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
 	}
+
+	// Pre-marshal JSON outside the mutex lock to eliminate contention
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return false
+	}
+
+	s.mu.Lock()
 	if s.seen[key] {
 		s.mu.Unlock()
 		return false
@@ -165,15 +172,12 @@ func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
 	s.seen[key] = true
 	s.messages = append(s.messages, msg)
 
-	msgBytes, err := json.Marshal(msg)
-	if err == nil {
-		if len(s.builder) == 0 {
-			s.builder = append(s.builder, '[')
-		} else {
-			s.builder = append(s.builder, ',')
-		}
-		s.builder = append(s.builder, msgBytes...)
+	if len(s.builder) == 0 {
+		s.builder = append(s.builder, '[')
+	} else {
+		s.builder = append(s.builder, ',')
 	}
+	s.builder = append(s.builder, msgBytes...)
 	s.mu.Unlock()
 
 	select {
@@ -1056,8 +1060,8 @@ func (l *customTCPListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = tc.SetReadBuffer(8 * 1024)
-	_ = tc.SetWriteBuffer(8 * 1024)
+	_ = tc.SetReadBuffer(16 * 1024)
+	_ = tc.SetWriteBuffer(64 * 1024)
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
@@ -1139,9 +1143,9 @@ func main() {
 		srv := &http.Server{
 			Handler:        handler,
 			MaxHeaderBytes: 8 * 1024,
-			ReadTimeout:    10 * time.Second,
-			WriteTimeout:   10 * time.Second,
-			IdleTimeout:    15 * time.Second,
+			ReadTimeout:    30 * time.Second,
+			WriteTimeout:   30 * time.Second,
+			IdleTimeout:    60 * time.Second,
 		}
 		go func(pNum int, listener net.Listener) {
 			log.Printf("[AUX] Listening on http://0.0.0.0:%d", pNum)
@@ -1159,9 +1163,9 @@ func main() {
 	server := &http.Server{
 		Handler:        handler,
 		MaxHeaderBytes: 8 * 1024,
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
-		IdleTimeout:    15 * time.Second,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    60 * time.Second,
 	}
 
 	log.Printf("==========================================")
