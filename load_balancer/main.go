@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
@@ -46,14 +49,51 @@ type AtomicFeedStore struct {
 	messages []FeedMessage
 	seen     map[string]bool
 	builder  []byte
+	shmFile  *os.File
 }
 
 func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
-	return &AtomicFeedStore{
+	store := &AtomicFeedStore{
 		messages: make([]FeedMessage, 0, 30000),
 		seen:     make(map[string]bool, 30000),
-		builder:  make([]byte, 0, 8*1024*1024), // Pre-allocated 8MB buffer eliminates all re-allocations
+		builder:  make([]byte, 0, 8*1024*1024),
 	}
+
+	shmPath := "/dev/shm/feed_backup.jsonl"
+	if f, err := os.Open(shmPath); err == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var msg FeedMessage
+			if err := json.Unmarshal(line, &msg); err == nil {
+				key := msg.ID
+				if key == "" {
+					key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
+				}
+				if !store.seen[key] {
+					store.seen[key] = true
+					store.messages = append(store.messages, msg)
+					if len(store.builder) == 0 {
+						store.builder = append(store.builder, '[')
+					} else {
+						store.builder = append(store.builder, ',')
+					}
+					store.builder = append(store.builder, line...)
+				}
+			}
+		}
+		f.Close()
+		log.Printf("[STORE] Recovered %d messages from /dev/shm/feed_backup.jsonl", len(store.messages))
+	}
+
+	if f, err := os.OpenFile(shmPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666); err == nil {
+		store.shmFile = f
+	}
+
+	return store
 }
 
 func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
@@ -62,7 +102,6 @@ func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
 		key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
 	}
 
-	// Pre-marshal JSON outside the mutex lock to eliminate contention
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
 		return false
@@ -82,6 +121,11 @@ func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
 		s.builder = append(s.builder, ',')
 	}
 	s.builder = append(s.builder, msgBytes...)
+
+	if s.shmFile != nil {
+		_, _ = s.shmFile.Write(msgBytes)
+		_, _ = s.shmFile.Write([]byte{'\n'})
+	}
 	s.mu.Unlock()
 
 	return true
@@ -97,7 +141,11 @@ func (s *AtomicFeedStore) Reset() {
 	s.mu.Lock()
 	s.messages = make([]FeedMessage, 0, 30000)
 	s.seen = make(map[string]bool, 30000)
-	s.builder = s.builder[:0] // Retain 8MB pre-allocated capacity without GC overhead
+	s.builder = s.builder[:0]
+	if s.shmFile != nil {
+		_ = s.shmFile.Truncate(0)
+		_, _ = s.shmFile.Seek(0, io.SeekStart)
+	}
 	s.mu.Unlock()
 
 	debug.FreeOSMemory()
@@ -800,8 +848,22 @@ func main() {
 
 	runtime.GOMAXPROCS(1)
 
-	debug.SetMemoryLimit(380 * 1024 * 1024)
-	debug.SetGCPercent(100)
+	// Clamp memory to 160MB to stay well below 512MB container ceiling
+	debug.SetMemoryLimit(160 * 1024 * 1024)
+	debug.SetGCPercent(25)
+
+	// Proactive memory watchdog: forces GC and returns OS pages if heap approaches 120MB
+	go func() {
+		var m runtime.MemStats
+		for {
+			time.Sleep(500 * time.Millisecond)
+			runtime.ReadMemStats(&m)
+			if m.Alloc > 120*1024*1024 {
+				runtime.GC()
+				debug.FreeOSMemory()
+			}
+		}
+	}()
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
@@ -849,10 +911,10 @@ func main() {
 		}
 		srv := &http.Server{
 			Handler:        handler,
-			MaxHeaderBytes: 8 * 1024,
-			ReadTimeout:    30 * time.Second,
-			WriteTimeout:   30 * time.Second,
-			IdleTimeout:    60 * time.Second,
+			MaxHeaderBytes: 4 * 1024,
+			ReadTimeout:    15 * time.Second,
+			WriteTimeout:   15 * time.Second,
+			IdleTimeout:    5 * time.Second,
 		}
 		go func(pNum int, listener net.Listener) {
 			log.Printf("[AUX] Listening on http://0.0.0.0:%d", pNum)
@@ -869,17 +931,17 @@ func main() {
 
 	server := &http.Server{
 		Handler:        handler,
-		MaxHeaderBytes: 8 * 1024,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 4 * 1024,
+		ReadTimeout:    15 * time.Second,
+		WriteTimeout:   15 * time.Second,
+		IdleTimeout:    5 * time.Second,
 	}
 
 	log.Printf("==========================================")
 	log.Printf("  Lab 6 Unified Ultra-Performance LB & Shared DB")
 	log.Printf("  Listening: http://0.0.0.0:%d (Aux: 3109, 3210, 4000, 4210)", *port)
 	log.Printf("  Threshold: %.0f  |  Backends: %d", pool.threshold, len(pool.backends))
-	log.Printf("  Durability Logs: %s, %s", *logFilePath, *sharedLogFilePath)
+	log.Printf("  Durability: In-Memory + /dev/shm fast sync")
 	log.Printf("==========================================")
 
 	if err := server.Serve(lMain); err != nil {
