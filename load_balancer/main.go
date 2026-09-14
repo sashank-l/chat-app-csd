@@ -44,18 +44,19 @@ type FeedMessage struct {
 }
 
 type AtomicFeedStore struct {
-	mu       sync.RWMutex
-	messages []FeedMessage
-	seen     map[string]bool
-	builder  []byte
-	shmFile  *os.File
+	mu      sync.RWMutex
+	builder []byte
+	count   int64
+	seen    map[string]struct{}
+	msgChan chan []byte
+	shmFile *os.File
 }
 
 func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
 	store := &AtomicFeedStore{
-		messages: make([]FeedMessage, 0, 30000),
-		seen:     make(map[string]bool, 30000),
-		builder:  make([]byte, 0, 8*1024*1024),
+		builder: make([]byte, 0, 8*1024*1024),
+		seen:    make(map[string]struct{}, 30000),
+		msgChan: make(chan []byte, 50000),
 	}
 
 	shmPath := "/dev/shm/feed_backup.jsonl"
@@ -72,75 +73,132 @@ func NewAtomicFeedStore(filePath string) *AtomicFeedStore {
 				if key == "" {
 					key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
 				}
-				if !store.seen[key] {
-					store.seen[key] = true
-					store.messages = append(store.messages, msg)
+				if _, ok := store.seen[key]; !ok {
+					store.seen[key] = struct{}{}
 					if len(store.builder) == 0 {
 						store.builder = append(store.builder, '[')
 					} else {
 						store.builder = append(store.builder, ',')
 					}
 					store.builder = append(store.builder, line...)
+					store.count++
 				}
 			}
 		}
 		f.Close()
-		log.Printf("[STORE] Recovered %d messages from /dev/shm/feed_backup.jsonl", len(store.messages))
+		log.Printf("[STORE] Recovered %d messages from /dev/shm/feed_backup.jsonl", store.count)
 	}
 
 	if f, err := os.OpenFile(shmPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666); err == nil {
 		store.shmFile = f
 	}
 
+	go store.worker()
+
 	return store
 }
 
-func (s *AtomicFeedStore) Add(msg FeedMessage) bool {
-	key := msg.ID
-	if key == "" {
-		key = fmt.Sprintf("%s_%s_%d", msg.ClientName, msg.Msg, msg.Timestamp)
-	}
+func (s *AtomicFeedStore) worker() {
+	bufWriter := bufio.NewWriterSize(s.shmFile, 64*1024)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return false
-	}
+	for {
+		select {
+		case data, ok := <-s.msgChan:
+			if !ok {
+				return
+			}
+			s.mu.Lock()
+			if len(s.builder) == 0 {
+				s.builder = append(s.builder, '[')
+			} else {
+				s.builder = append(s.builder, ',')
+			}
+			s.builder = append(s.builder, data...)
+			s.count++
+			s.mu.Unlock()
 
-	s.mu.Lock()
-	if s.seen[key] {
+			if s.shmFile != nil {
+				_, _ = bufWriter.Write(data)
+				_ = bufWriter.WriteByte('\n')
+			}
+		case <-ticker.C:
+			if s.shmFile != nil {
+				_ = bufWriter.Flush()
+			}
+		}
+	}
+}
+
+func (s *AtomicFeedStore) Add(msgBytes []byte) bool {
+	select {
+	case s.msgChan <- msgBytes:
+		return true
+	default:
+		s.mu.Lock()
+		if len(s.builder) == 0 {
+			s.builder = append(s.builder, '[')
+		} else {
+			s.builder = append(s.builder, ',')
+		}
+		s.builder = append(s.builder, msgBytes...)
+		s.count++
 		s.mu.Unlock()
-		return false
+		return true
 	}
-	s.seen[key] = true
-	s.messages = append(s.messages, msg)
+}
 
+func (s *AtomicFeedStore) GetFeedBytes() []byte {
+	for {
+		select {
+		case data := <-s.msgChan:
+			s.mu.Lock()
+			if len(s.builder) == 0 {
+				s.builder = append(s.builder, '[')
+			} else {
+				s.builder = append(s.builder, ',')
+			}
+			s.builder = append(s.builder, data...)
+			s.count++
+			s.mu.Unlock()
+			if s.shmFile != nil {
+				_, _ = s.shmFile.Write(data)
+				_, _ = s.shmFile.Write([]byte{'\n'})
+			}
+		default:
+			goto Drained
+		}
+	}
+Drained:
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if len(s.builder) == 0 {
-		s.builder = append(s.builder, '[')
-	} else {
-		s.builder = append(s.builder, ',')
+		return []byte("[]")
 	}
-	s.builder = append(s.builder, msgBytes...)
-
-	if s.shmFile != nil {
-		_, _ = s.shmFile.Write(msgBytes)
-		_, _ = s.shmFile.Write([]byte{'\n'})
-	}
-	s.mu.Unlock()
-
-	return true
+	buf := make([]byte, len(s.builder)+1)
+	copy(buf, s.builder)
+	buf[len(s.builder)] = ']'
+	return buf
 }
 
 func (s *AtomicFeedStore) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.messages)
+	return int(atomic.LoadInt64(&s.count))
 }
 
 func (s *AtomicFeedStore) Reset() {
+	for {
+		select {
+		case <-s.msgChan:
+		default:
+			goto ResetDrained
+		}
+	}
+ResetDrained:
 	s.mu.Lock()
-	s.messages = make([]FeedMessage, 0, 30000)
-	s.seen = make(map[string]bool, 30000)
+	s.seen = make(map[string]struct{}, 30000)
 	s.builder = s.builder[:0]
+	atomic.StoreInt64(&s.count, 0)
 	if s.shmFile != nil {
 		_ = s.shmFile.Truncate(0)
 		_, _ = s.shmFile.Seek(0, io.SeekStart)
@@ -624,17 +682,8 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		}
 
 		nowMs := time.Now().UnixMilli()
-		feedMsg := FeedMessage{
-			ID:         msgID,
-			ClientName: clientName,
-			Msg:        msgText,
-			Timestamp:  nowMs,
-		}
-
-		pool.store.Add(feedMsg)
-
-		// Direct zero-allocation addition to SharedDB
-		sharedDB.AddSingle(msgID, clientName, msgText, nowMs)
+		msgJSON := []byte(fmt.Sprintf(`{"id":"%s","client-name":%q,"msg":%q,"timestamp":%d}`, msgID, clientName, msgText, nowMs))
+		pool.store.Add(msgJSON)
 
 		// Record backend routing metrics for /lb-stats
 		if best := pool.SelectBest(); best != nil {
@@ -658,25 +707,10 @@ func makeHandler(pool *ServerPool, sharedDB *SharedDB) http.Handler {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-
-		pool.store.mu.RLock()
-		n := len(pool.store.builder)
-		if n == 0 {
-			pool.store.mu.RUnlock()
-			w.Header().Set("Content-Length", "2")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("[]"))
-			return
-		}
-
-		buf := make([]byte, n+1)
-		copy(buf, pool.store.builder)
-		pool.store.mu.RUnlock()
-		buf[n] = ']'
-
-		w.Header().Set("Content-Length", strconv.Itoa(len(buf)))
+		data := pool.store.GetFeedBytes()
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(buf)
+		_, _ = w.Write(data)
 	})
 
 	// ── POST /messages/batch ─────────────────────────────────────────────────
@@ -816,8 +850,8 @@ func (l *customTCPListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = tc.SetReadBuffer(32 * 1024)
-	_ = tc.SetWriteBuffer(32 * 1024)
+	_ = tc.SetReadBuffer(16 * 1024)
+	_ = tc.SetWriteBuffer(16 * 1024)
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
@@ -847,22 +881,9 @@ func main() {
 
 	runtime.GOMAXPROCS(4)
 
-	// Clamp memory to 160MB to stay well below 512MB container ceiling
-	debug.SetMemoryLimit(160 * 1024 * 1024)
-	debug.SetGCPercent(25)
-
-	// Proactive memory watchdog: forces GC and returns OS pages if heap approaches 120MB
-	go func() {
-		var m runtime.MemStats
-		for {
-			time.Sleep(500 * time.Millisecond)
-			runtime.ReadMemStats(&m)
-			if m.Alloc > 120*1024*1024 {
-				runtime.GC()
-				debug.FreeOSMemory()
-			}
-		}
-	}()
+	// Clamp memory to 180MB with standard low-latency GC
+	debug.SetMemoryLimit(180 * 1024 * 1024)
+	debug.SetGCPercent(50)
 
 	port := flag.Int("port", 3000, "Load Balancer listening port")
 	backendsStr := flag.String("backends",
