@@ -816,8 +816,8 @@ func (l *customTCPListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = tc.SetReadBuffer(4 * 1024)
-	_ = tc.SetWriteBuffer(4 * 1024)
+	_ = tc.SetReadBuffer(32 * 1024)
+	_ = tc.SetWriteBuffer(32 * 1024)
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
@@ -845,7 +845,7 @@ func main() {
 		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 	}
 
-	runtime.GOMAXPROCS(1)
+	runtime.GOMAXPROCS(4)
 
 	// Clamp memory to 160MB to stay well below 512MB container ceiling
 	debug.SetMemoryLimit(160 * 1024 * 1024)
